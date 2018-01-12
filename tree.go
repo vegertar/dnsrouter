@@ -42,8 +42,9 @@ const (
 )
 
 type nodeHandlerElement struct {
-	Qtype   uint16
-	Handler Handler
+	Qtype       uint16
+	TypeCovered uint16
+	Handler     Handler
 }
 
 // NodeHandler is the data associating with a node in tree.
@@ -54,14 +55,15 @@ func (l NodeHandler) Len() int {
 }
 
 func (l NodeHandler) Less(a, b int) bool {
-	return l[a].Qtype < l[b].Qtype
+	return l[a].Qtype < l[b].Qtype ||
+		l[a].Qtype == l[b].Qtype && l[a].TypeCovered < l[b].TypeCovered
 }
 
 func (l NodeHandler) Swap(a, b int) {
 	l[a], l[b] = l[b], l[a]
 }
 
-// Search returns a combined Handler matching with qtype.
+// Search returns a slice matching with qtype.
 func (l NodeHandler) Search(qtype uint16) NodeHandler {
 	i := sort.Search(len(l), func(i int) bool {
 		return l[i].Qtype >= qtype
@@ -69,6 +71,26 @@ func (l NodeHandler) Search(qtype uint16) NodeHandler {
 
 	offset := -1
 	for i < len(l) && l[i].Qtype == qtype {
+		if offset == -1 {
+			offset = i
+		}
+		i++
+	}
+	if offset != -1 {
+		return l[offset:i]
+	}
+	return nil
+}
+
+// SearchCovered returns a slice matching with typeCovered.
+// This method should be called on a slice returned from method .Search(qtype).
+func (l NodeHandler) SearchCovered(typeCovered uint16) NodeHandler {
+	i := sort.Search(len(l), func(i int) bool {
+		return l[i].TypeCovered >= typeCovered
+	})
+
+	offset := -1
+	for i < len(l) && l[i].TypeCovered == typeCovered {
 		if offset == -1 {
 			offset = i
 		}
@@ -214,7 +236,7 @@ func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) 
 
 				c := name[0]
 
-				// slash after param
+				// dot after param
 				if n.nType == param && c == '.' && len(n.children) == 1 {
 					n = n.children[0]
 					n.priority++
@@ -471,22 +493,6 @@ func (n *node) findCaseInsensitiveName(name string) (ciName []byte, found bool) 
 	)
 }
 
-// shift bytes in array by n bytes left
-func shiftNRuneBytes(rb [4]byte, n int) [4]byte {
-	switch n {
-	case 0:
-		return rb
-	case 1:
-		return [4]byte{rb[1], rb[2], rb[3], 0}
-	case 2:
-		return [4]byte{rb[2], rb[3]}
-	case 3:
-		return [4]byte{rb[3]}
-	default:
-		return [4]byte{}
-	}
-}
-
 // recursive case-insensitive lookup function used by n.findCaseInsensitiveName
 func (n *node) findCaseInsensitiveNameRec(name, loName string, ciName []byte, rb [4]byte) ([]byte, bool) {
 	loNName := strings.ToLower(n.name)
@@ -616,4 +622,20 @@ walk: // outer loop for walking the tree
 
 	// Nothing found.
 	return ciName, false
+}
+
+// shift bytes in array by n bytes left
+func shiftNRuneBytes(rb [4]byte, n int) [4]byte {
+	switch n {
+	case 0:
+		return rb
+	case 1:
+		return [4]byte{rb[1], rb[2], rb[3], 0}
+	case 2:
+		return [4]byte{rb[2], rb[3]}
+	case 3:
+		return [4]byte{rb[3]}
+	default:
+		return [4]byte{}
+	}
 }
