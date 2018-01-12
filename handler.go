@@ -141,7 +141,7 @@ var (
 )
 
 var (
-	aTypes = []uint16{dns.TypeA, dns.TypeAAAA}
+	aReqTypes = []uint16{dns.TypeA, dns.TypeAAAA}
 )
 
 // ParamsHandler fills the params into request context.
@@ -231,13 +231,16 @@ func CnameHandler(h Handler) Handler {
 	})
 }
 
-// NsHandler is a middleware filling out the glue records.
-func NsHandler(h Handler) Handler {
+// GlueHandler is a middleware filling out the glue records.
+func GlueHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
 
-		if result := w.Msg(); result.Rcode == dns.RcodeSuccess && len(result.Answer) > 0 {
-			delegated := false
+		if req.Question[0].Qtype != dns.TypeNS {
+			return
+		}
+
+		if result := w.Msg(); result.Rcode == dns.RcodeSuccess {
 			noData := true
 
 			for _, rr := range result.Answer {
@@ -247,27 +250,17 @@ func NsHandler(h Handler) Handler {
 
 				noData = false
 				ns := rr.(*dns.NS).Ns
-				if strings.HasSuffix(ns, rr.Header().Name) {
-					delegated = true
-				}
-
-				for _, t := range aTypes {
+				for _, t := range aReqTypes {
 					glueWriter := FurtherRequest(w, req, ns, t, h)
 					if glueWriter.Rcode == dns.RcodeNameError {
 						break
 					}
-
 					result.Extra = append(result.Extra, glueWriter.Answer...)
 				}
 			}
 
 			if !noData {
 				result.Authoritative = true
-
-				if delegated {
-					result.Answer, result.Ns = result.Ns, result.Answer
-					result.Authoritative = false
-				}
 			}
 		}
 	})
@@ -301,7 +294,7 @@ func ExtraHandler(h Handler) Handler {
 					continue
 				}
 
-				for _, t := range aTypes {
+				for _, t := range aReqTypes {
 					extraWriter := FurtherRequest(w, req, target, t, h)
 					if extraWriter.Rcode == dns.RcodeNameError {
 						break
@@ -577,6 +570,7 @@ var (
 		OptHandler,
 		NsecHandler,
 		NxHandler,
+		GlueHandler,
 		ExtraHandler,
 		CnameHandler,
 	}
