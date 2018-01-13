@@ -395,8 +395,22 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler nodeH
 }
 
 // Returns the handler registered with the given name (key). The values of
-// wildcards are saved to a map.
-func (n *node) getValue(name string) (handler NodeHandler, p Params) {
+// wildcards are saved to a map. The third returned value cut indicating whether
+// the searching is ending at a cut of a name.
+func (n *node) getValue(name string) (handler NodeHandler, p Params, cut bool) {
+	var end int
+
+	defer func() {
+		if l := len(name); handler == nil {
+			switch n.nType {
+			case static:
+				cut = l < len(n.name) && n.name[l] == '.'
+			case param:
+				// both name and n.name have no child.
+				cut = end == len(name)
+			}
+		}
+	}()
 walk: // outer loop for walking the tree
 	for {
 		if len(name) > len(n.name) && name[:len(n.name)] == n.name {
@@ -422,7 +436,7 @@ walk: // outer loop for walking the tree
 			switch n.nType {
 			case param:
 				// find param end (either '.' or name end)
-				end := 0
+				end = 0
 				for end < len(name) && name[end] != '.' {
 					end++
 				}

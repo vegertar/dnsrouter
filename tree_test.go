@@ -38,11 +38,12 @@ type testRequests []struct {
 	nilHandler bool
 	route      string
 	ps         Params
+	cut        bool
 }
 
 func checkRequests(t *testing.T, tree *node, requests testRequests) {
 	for _, request := range requests {
-		handler, ps := tree.getValue(request.name)
+		handler, ps, cut := tree.getValue(request.name)
 
 		if handler == nil {
 			if !request.nilHandler {
@@ -59,6 +60,9 @@ func checkRequests(t *testing.T, tree *node, requests testRequests) {
 
 		if !reflect.DeepEqual(ps, request.ps) {
 			t.Errorf("Params mismatch for route '%s'", request.name)
+		}
+		if cut != request.cut {
+			t.Errorf("cut(%v) mismatch for route '%s'", request.cut, request.name)
 		}
 	}
 }
@@ -137,17 +141,19 @@ func TestTreeAddAndGet(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".a", false, ".a", nil},
-		{".", true, "", nil},
-		{".hi", false, ".hi", nil},
-		{".contact", false, ".contact", nil},
-		{".co", false, ".co", nil},
-		{".con", true, "", nil},  // key mismatch
-		{".cona", true, "", nil}, // key mismatch
-		{".no", true, "", nil},   // no matching child
-		{".ab", false, ".ab", nil},
-		{".α", false, ".α", nil},
-		{".β", false, ".β", nil},
+		{".a", false, ".a", nil, false},
+		{".", true, "", nil, false},
+		{".hi", false, ".hi", nil, false},
+		{".contact", false, ".contact", nil, false},
+		{".co", false, ".co", nil, false},
+		{".con", true, "", nil, false},  // key mismatch
+		{".cona", true, "", nil, false}, // key mismatch
+		{".no", true, "", nil, false},   // no matching child
+		{".ab", false, ".ab", nil, false},
+		{".α", false, ".α", nil, false},
+		{".β", false, ".β", nil, false},
+		{".doc", true, "", nil, true},
+		{".doc.go1", true, "", nil, true},
 	})
 
 	checkPriorities(t, tree)
@@ -180,20 +186,20 @@ func TestTreeWildcard(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", false, ".", nil},
-		{".cmd.test.", false, ".cmd.:tool.", Params{Param{"tool", "test"}}},
-		{".cmd.test", true, "", Params{Param{"tool", "test"}}},
-		{".cmd.test.3", false, ".cmd.:tool.:sub", Params{Param{"tool", "test"}, Param{"sub", "3"}}},
-		{".src.", false, ".src.*filename", Params{Param{"filename", "."}}},
-		{".src.some.file.png", false, ".src.*filename", Params{Param{"filename", ".some.file.png"}}},
-		{".search.", false, ".search.", nil},
-		{".search.someth!ng+in+ünìcodé", false, ".search.:query", Params{Param{"query", "someth!ng+in+ünìcodé"}}},
-		{".search.someth!ng+in+ünìcodé.", true, "", Params{Param{"query", "someth!ng+in+ünìcodé"}}},
-		{".user_gopher", false, ".user_:name", Params{Param{"name", "gopher"}}},
-		{".user_gopher.about", false, ".user_:name.about", Params{Param{"name", "gopher"}}},
-		{".files.js.inc.framework.js", false, ".files.:dir.*filename", Params{Param{"dir", "js"}, Param{"filename", ".inc.framework.js"}}},
-		{".info.gordon.public", false, ".info.:user.public", Params{Param{"user", "gordon"}}},
-		{".info.gordon.project.go", false, ".info.:user.project.:project", Params{Param{"user", "gordon"}, Param{"project", "go"}}},
+		{".", false, ".", nil, false},
+		{".cmd.test.", false, ".cmd.:tool.", Params{Param{"tool", "test"}}, false},
+		{".cmd.test", true, "", Params{Param{"tool", "test"}}, true},
+		{".cmd.test.3", false, ".cmd.:tool.:sub", Params{Param{"tool", "test"}, Param{"sub", "3"}}, false},
+		{".src.", false, ".src.*filename", Params{Param{"filename", "."}}, false},
+		{".src.some.file.png", false, ".src.*filename", Params{Param{"filename", ".some.file.png"}}, false},
+		{".search.", false, ".search.", nil, false},
+		{".search.someth!ng+in+ünìcodé", false, ".search.:query", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".search.someth!ng+in+ünìcodé.", true, "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".user_gopher", false, ".user_:name", Params{Param{"name", "gopher"}}, false},
+		{".user_gopher.about", false, ".user_:name.about", Params{Param{"name", "gopher"}}, false},
+		{".files.js.inc.framework.js", false, ".files.:dir.*filename", Params{Param{"dir", "js"}, Param{"filename", ".inc.framework.js"}}, false},
+		{".info.gordon.public", false, ".info.:user.public", Params{Param{"user", "gordon"}}, false},
+		{".info.gordon.project.go", false, ".info.:user.project.:project", Params{Param{"user", "gordon"}, Param{"project", "go"}}, false},
 	})
 
 	checkPriorities(t, tree)
@@ -310,11 +316,11 @@ func TestTreeDupliateName(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", false, ".", nil},
-		{".doc.", false, ".doc.", nil},
-		{".src.some.file.png", false, ".src.*filename", Params{Param{"filename", ".some.file.png"}}},
-		{".search.someth!ng+in+ünìcodé", false, ".search.:query", Params{Param{"query", "someth!ng+in+ünìcodé"}}},
-		{".user_gopher", false, ".user_:name", Params{Param{"name", "gopher"}}},
+		{".", false, ".", nil, false},
+		{".doc.", false, ".doc.", nil, false},
+		{".src.some.file.png", false, ".src.*filename", Params{Param{"filename", ".some.file.png"}}, false},
+		{".search.someth!ng+in+ünìcodé", false, ".search.:query", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".user_gopher", false, ".user_:name", Params{Param{"name", "gopher"}}, false},
 	})
 }
 

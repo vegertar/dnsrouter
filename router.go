@@ -105,6 +105,27 @@ func (r *Router) HandleFunc(s string, handlerFunc HandlerFunc) {
 	r.Handle(s, handlerFunc)
 }
 
+// HandleZoneFile loads a zone file.
+func (r *Router) HandleZoneFile(origin, filename string) {
+	f, err := os.Open(filename)
+	if err != nil {
+		panic(err)
+	}
+
+	r.HandleZone(f, origin, path.Base(filename))
+}
+
+// HandleZone loads a zone reader.
+func (r *Router) HandleZone(f io.Reader, origin, filename string) {
+	for x := range dns.ParseZone(f, dns.Fqdn(origin), filename) {
+		if x.Error != nil {
+			panic(x.Error)
+		}
+
+		r.Handle(x.RR.String(), nil)
+	}
+}
+
 func (r *Router) handle(name string, qclass, qtype, typeCovered uint16, handler Handler) {
 	if name == "" || len(name) > 1 && isIndexable(name) {
 		panic(name + ": illegal domain")
@@ -164,21 +185,23 @@ func (r *Router) nsecPrevious(name string, qclass, qtype uint16) (indexableName 
 // This is e.g. useful to build a framework around this router.
 // If found the name, it returns the node handlers which sorted by field Qtype,
 // and the name parameter values.
-func (r *Router) Lookup(name string, qclass uint16) (NodeHandler, Params) {
+// Otherwise, the third boolean value indicating whether the name is a cut
+// that stopping by '.' within searching path.
+func (r *Router) Lookup(name string, qclass uint16) (NodeHandler, Params, bool) {
 	name = IndexableName(name)
 
 FALLBACK:
 	if root := r.trees[qclass]; root != nil {
-		v, params := root.getValue(name)
-		if v != nil {
-			return v, params
+		v, params, cut := root.getValue(name)
+		if v != nil || cut {
+			return v, params, cut
 		}
 	}
 
 	if root := r.wildcardTrees[qclass]; root != nil {
-		v, params := root.getValue(name)
-		if v != nil {
-			return v, params
+		v, params, cut := root.getValue(name)
+		if v != nil || cut {
+			return v, params, cut
 		}
 	}
 
@@ -187,12 +210,12 @@ FALLBACK:
 		goto FALLBACK
 	}
 
-	return nil, nil
+	return nil, nil, false
 }
 
 // LookupNSEC performs like Lookup whereas with parameter qtype
 // which is either dns.TypeNSEC or dns.TypeNSEC3.
-func (r *Router) LookupNSEC(name string, qclass, qtype uint16) (NodeHandler, Params) {
+func (r *Router) LookupNSEC(name string, qclass, qtype uint16) (NodeHandler, Params, bool) {
 	// TODO: supports NSEC3
 	name = IndexableName(name)
 	if previousName, found := r.nsecPrevious(name, qclass, qtype); previousName != "" {
@@ -201,59 +224,46 @@ func (r *Router) LookupNSEC(name string, qclass, qtype uint16) (NodeHandler, Par
 		}
 		return r.Lookup(name, qclass)
 	}
-	return nil, nil
+	return nil, nil, false
 }
 
-// HandleZoneFile loads a zone file.
-func (r *Router) HandleZoneFile(origin, filename string) {
-	f, err := os.Open(filename)
-	if err != nil {
-		panic(err)
-	}
-
-	r.HandleZone(f, origin, path.Base(filename))
-}
-
-// HandleZone loads a zone reader.
-func (r *Router) HandleZone(f io.Reader, origin, filename string) {
-	for x := range dns.ParseZone(f, dns.Fqdn(origin), filename) {
-		if x.Error != nil {
-			panic(x.Error)
-		}
-
-		r.Handle(x.RR.String(), nil)
-	}
-}
-
-// ServeDNS makes the router implement the Handler interface.
-func (r *Router) ServeDNS(w ResponseWriter, req *Request) {
-	q := req.Question[0]
-	h := r.lookupHandler(dns.Fqdn(q.Name), q.Qclass, q.Qtype, req.IsEdns0())
-	h.ServeDNS(w, req)
-}
-
-func (r *Router) lookupHandler(name string, qclass, qtype uint16, opt *dns.OPT) (h Handler) {
+// LookupHandler performs an automated lookup of a DNS request.
+func (r *Router) LookupHandler(msg *dns.Msg) (h Handler) {
+	q := msg.Question[0]
+	qclass := q.Qclass
+	qtype := q.Qtype
+	opt := msg.IsEdns0()
 	do := opt != nil && opt.Do()
-	indexableName := IndexableName(name)
+	indexableName := IndexableName(dns.Fqdn(q.Name))
 
 	var (
 		nodeHandlers NodeHandler
 		params       Params
+		cut          bool
 		isNsec       bool
 	)
 
 	if qtype == dns.TypeNSEC || qtype == dns.TypeNSEC3 {
 		isNsec = true
-		nodeHandlers, params = r.LookupNSEC(indexableName, qclass, qtype)
+		nodeHandlers, params, cut = r.LookupNSEC(indexableName, qclass, qtype)
 	} else {
-		nodeHandlers, params = r.Lookup(indexableName, qclass)
+		nodeHandlers, params, cut = r.Lookup(indexableName, qclass)
 	}
 
 	if nodeHandlers == nil {
-		if r.NoName != nil {
-			h = r.NoName
+		if cut {
+			// no error, but no data
+			if r.NoData != nil {
+				h = r.NoData
+			} else {
+				h = NoErrorHandler
+			}
 		} else {
-			h = NameErrorHandler
+			if r.NoName != nil {
+				h = r.NoName
+			} else {
+				h = NameErrorHandler
+			}
 		}
 
 		return h
@@ -322,6 +332,11 @@ func (r *Router) lookupHandler(name string, qclass, qtype uint16, opt *dns.OPT) 
 	}
 
 	return RefusedErrorHandler
+}
+
+// ServeDNS makes the router implement the Handler interface.
+func (r *Router) ServeDNS(w ResponseWriter, req *Request) {
+	r.LookupHandler(req.Msg).ServeDNS(w, req)
 }
 
 // IndexableName returns a name for indexing.
