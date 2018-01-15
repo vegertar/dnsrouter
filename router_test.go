@@ -455,7 +455,7 @@ mx		IN	MX      10 a.miek.nl.`
 	}
 }
 
-func BenchmarkCnameHandler(b *testing.B) {
+func BenchmarkLookup(b *testing.B) {
 	const s = `
 $TTL    30M
 $ORIGIN miek.nl.
@@ -1689,7 +1689,7 @@ sub.example.org.	1800	IN NS	sub1.example.net.
 				aaaa("a.delegated.example.org. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
 			},
 		},
-		/*{
+		{
 			Qname: "delegated.example.org.", Qtype: dns.TypeNS,
 			Do: true,
 			Ns: []dns.RR{
@@ -1754,7 +1754,6 @@ sub.example.org.	1800	IN NS	sub1.example.net.
 				opt(4096, true),
 			},
 		},
-		*/
 	}
 
 	router := New()

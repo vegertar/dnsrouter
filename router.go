@@ -306,9 +306,16 @@ func (r *Router) LookupHandler(msg *dns.Msg) Handler {
 	}
 
 	var (
-		v NodeHandler
-		h Handler
+		ds, dsSig NodeHandler
+		v         NodeHandler
+		h         Handler
 	)
+
+	if qtype == dns.TypeNS {
+		// might be a delegation
+		ds = nodeHandlers.Search(dns.TypeDS)
+		dsSig = rrsigHandlers.SearchCovered(dns.TypeDS)
+	}
 
 FALLBACK:
 	v = nodeHandlers.Search(qtype)
@@ -328,11 +335,19 @@ FALLBACK:
 		h = ParamsHandler(v, params)
 	}
 
+	m := make([]Handler, 0, 4)
+	m = append(m, h)
 	if qtypeSig != nil {
-		h = MultipleHandler(h, ParamsHandler(qtypeSig, params))
+		m = append(m, ParamsHandler(qtypeSig, params))
+	}
+	if ds != nil {
+		m = append(m, ParamsHandler(ds, params))
+		if dsSig != nil {
+			m = append(m, ParamsHandler(dsSig, params))
+		}
 	}
 
-	return h
+	return MultipleHandler(m...)
 }
 
 // ServeDNS makes the router implement the Handler interface.

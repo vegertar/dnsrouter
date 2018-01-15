@@ -263,120 +263,6 @@ func ExtraHandler(h Handler) Handler {
 	})
 }
 
-// NxHandler is a middleware filling out a SOA record if occurs NXDOMAIN or NOERROR with no data,
-// as well as filling out NS records for non-NS queries. The authoritative field will be set
-// appropriately depending whether the requested owner name is delegated or not.
-func NxHandler(h Handler) Handler {
-	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		h.ServeDNS(w, req)
-
-		var (
-			qtype  = req.Question[0].Qtype
-			qname  = req.Question[0].Name
-			result = w.Msg()
-			offset = 0
-			rcode  = result.Rcode
-			answer = result.Answer
-		)
-
-		if rcode != dns.RcodeNameError && rcode != dns.RcodeSuccess ||
-			existsAny(result.Ns, dns.TypeNS, dns.TypeSOA) {
-			return
-		}
-
-		if i := firstNotAny(answer,
-			dns.TypeCNAME,
-			dns.TypeRRSIG,
-			dns.TypeNSEC,
-			dns.TypeNSEC3,
-		); i != -1 {
-			qname, answer = answer[i].Header().Name, answer[i:]
-		}
-
-		var (
-			ns, soa dns.Msg
-			hasData bool
-		)
-
-		defer func() {
-			result.Authoritative = true
-			if len(soa.Answer) == 0 {
-				// delegated
-				result.Authoritative = false
-				result.Answer = nil
-				result.Ns = append(result.Ns, ns.Answer...)
-				result.Extra = append(result.Extra, ns.Extra...)
-				if result.Rcode == dns.RcodeNameError {
-					result.Rcode = dns.RcodeSuccess
-				}
-				if i := first(result.Ns, dns.TypeNS); i != -1 {
-					if opt := req.IsEdns0(); opt != nil && opt.Do() {
-						ds := FurtherRequest(w, req, result.Ns[i].Header().Name, dns.TypeDS, h)
-						result.Ns = append(result.Ns, ds.Answer...)
-					}
-				}
-			} else if hasData {
-				if qtype != dns.TypeNS {
-					result.Ns = append(result.Ns, ns.Answer...)
-					result.Extra = append(result.Extra, ns.Extra...)
-				}
-			} else {
-				result.Ns = append(result.Ns, soa.Answer...)
-				result.Extra = append(result.Extra, soa.Extra...)
-			}
-		}()
-
-		if i := first(answer, qtype); i != -1 {
-			hasData = true
-			if qtype == dns.TypeNS {
-				ns.Answer = result.Answer
-				if m := FurtherRequest(w, req, qname, dns.TypeSOA, h); exists(m.Answer, dns.TypeSOA) {
-					soa = m
-				}
-				return
-			}
-		}
-
-		if nsOwner, soaOwner := apexFromNsec(result.Ns); nsOwner != "" || soaOwner != "" {
-			if nsOwner != soaOwner && len(nsOwner) > len(soaOwner) {
-				ns = FurtherRequest(w, req, nsOwner, dns.TypeNS, h)
-			} else if !hasData {
-				soa = FurtherRequest(w, req, soaOwner, dns.TypeSOA, h)
-			}
-
-			return
-		}
-
-		for i, end := 0, false; !end && len(ns.Answer) == 0; i++ {
-			if rcode == dns.RcodeNameError || i > 0 {
-				offset, end = dns.NextLabel(qname, offset)
-			}
-
-			if !end {
-				name := qname[offset:]
-				if len(ns.Answer) == 0 {
-					m := FurtherRequest(w, req, name, dns.TypeNS, h)
-					if m.Rcode == dns.RcodeNameError {
-						continue
-					}
-					if exists(m.Answer, dns.TypeNS) {
-						ns = m
-					}
-				}
-				if len(soa.Answer) == 0 {
-					m := FurtherRequest(w, req, name, dns.TypeSOA, h)
-					if m.Rcode == dns.RcodeNameError {
-						continue
-					}
-					if exists(m.Answer, dns.TypeSOA) {
-						soa = m
-					}
-				}
-			}
-		}
-	})
-}
-
 // NsecHandler is a middleware filling out denial-of-existence records.
 func NsecHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
@@ -438,6 +324,118 @@ func NsecHandler(h Handler) Handler {
 	})
 }
 
+// NxHandler is a middleware filling out a SOA record if occurs NXDOMAIN or NOERROR with no data,
+// as well as filling out NS records for non-NS queries. The authoritative field will be set
+// appropriately depending whether the requested owner name is delegated or not.
+func NxHandler(h Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		h.ServeDNS(w, req)
+
+		var (
+			qtype  = req.Question[0].Qtype
+			qname  = req.Question[0].Name
+			result = w.Msg()
+			offset = 0
+			rcode  = result.Rcode
+			answer = result.Answer
+		)
+
+		if rcode != dns.RcodeNameError && rcode != dns.RcodeSuccess ||
+			existsAny(result.Ns, dns.TypeNS, dns.TypeSOA) {
+			return
+		}
+
+		if i := firstNotAny(answer,
+			dns.TypeCNAME,
+			dns.TypeRRSIG,
+			dns.TypeNSEC,
+			dns.TypeNSEC3,
+		); i != -1 {
+			qname, answer = answer[i].Header().Name, answer[i:]
+		}
+
+		var (
+			ns, soa dns.Msg
+			hasData bool
+		)
+
+		defer func() {
+			result.Authoritative = true
+			if len(soa.Answer) == 0 {
+				// delegated
+				result.Authoritative = false
+				if qtype != dns.TypeDS {
+					result.Answer = nil
+				}
+				result.Ns = ns.Answer
+				result.Extra = ns.Extra
+				if result.Rcode == dns.RcodeNameError {
+					result.Rcode = dns.RcodeSuccess
+				}
+			} else if hasData {
+				if qtype != dns.TypeNS {
+					result.Ns = append(result.Ns, ns.Answer...)
+					result.Extra = append(result.Extra, ns.Extra...)
+				}
+			} else {
+				result.Ns = append(result.Ns, soa.Answer...)
+				result.Extra = append(result.Extra, soa.Extra...)
+			}
+		}()
+
+		if i := first(answer, qtype); i != -1 {
+			hasData = true
+			if qtype == dns.TypeNS {
+				ns.Answer, ns.Extra = result.Answer, result.Extra
+				if m := FurtherRequest(w, req, qname, dns.TypeSOA, h); exists(m.Answer, dns.TypeSOA) {
+					soa = m
+				}
+				return
+			}
+		}
+
+		if nsOwner, soaOwner := apexFromNsec(result.Ns); nsOwner != "" || soaOwner != "" {
+			if nsOwner != soaOwner && len(nsOwner) > len(soaOwner) {
+				ns = FurtherRequest(w, req, nsOwner, dns.TypeNS, h)
+			} else if !hasData {
+				soa = FurtherRequest(w, req, soaOwner, dns.TypeSOA, h)
+			}
+
+			return
+		}
+
+		for i, end := 0, false; !end && len(ns.Answer) == 0; i++ {
+			if rcode == dns.RcodeNameError || // directly go up when NXDOMAIN
+				hasData && qtype == dns.TypeDS || // always go up for delegation
+				i > 0 { // go up from 2nd iteration when NOERROR but no data
+				offset, end = dns.NextLabel(qname, offset)
+			}
+
+			if !end {
+				name := qname[offset:]
+				if len(ns.Answer) == 0 {
+					m := FurtherRequest(w, req, name, dns.TypeNS, h)
+					if m.Rcode == dns.RcodeNameError {
+						continue
+					}
+					if exists(m.Answer, dns.TypeNS) {
+						ns = m
+					}
+				}
+				if len(soa.Answer) == 0 {
+					m := FurtherRequest(w, req, name, dns.TypeSOA, h)
+					if m.Rcode == dns.RcodeNameError {
+						continue
+					}
+					if exists(m.Answer, dns.TypeSOA) {
+						soa = m
+					}
+				}
+			}
+		}
+	})
+}
+
 // OptHandler is a middleware filling out OPT records if request is compatible with EDNS0.
 func OptHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
@@ -460,6 +458,18 @@ func OptHandler(h Handler) Handler {
 				resultOpt.SetDo()
 			}
 			result.Extra = append(result.Extra, &resultOpt)
+		}
+	})
+}
+
+// RefusedHandler is a middleware setting REFUSED code if no ANSWERs or NSs either.
+func RefusedHandler(h Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		h.ServeDNS(w, req)
+
+		result := w.Msg()
+		if len(result.Answer) == 0 && len(result.Ns) == 0 && result.Rcode == dns.RcodeSuccess {
+			result.Rcode = dns.RcodeRefused
 		}
 	})
 }
@@ -556,6 +566,7 @@ var (
 	// DefaultScheme consists of essential middlewares.
 	DefaultScheme = []Middleware{
 		PanicHandler,
+		RefusedHandler,
 		OptHandler,
 		NxHandler,
 		NsecHandler,
