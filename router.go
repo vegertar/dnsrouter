@@ -228,29 +228,30 @@ func (r *Router) LookupNSEC(name string, qclass, qtype uint16) (NodeHandler, Par
 }
 
 // LookupHandler performs an automated lookup of a DNS request.
-func (r *Router) LookupHandler(msg *dns.Msg) (h Handler) {
+func (r *Router) LookupHandler(msg *dns.Msg) Handler {
 	q := msg.Question[0]
 	qclass := q.Qclass
 	qtype := q.Qtype
 	opt := msg.IsEdns0()
 	do := opt != nil && opt.Do()
+	isNsec := qtype == dns.TypeNSEC || qtype == dns.TypeNSEC3
 	indexableName := IndexableName(dns.Fqdn(q.Name))
 
 	var (
 		nodeHandlers NodeHandler
 		params       Params
 		cut          bool
-		isNsec       bool
 	)
 
-	if qtype == dns.TypeNSEC || qtype == dns.TypeNSEC3 {
-		isNsec = true
+	if isNsec && do {
 		nodeHandlers, params, cut = r.LookupNSEC(indexableName, qclass, qtype)
 	} else {
 		nodeHandlers, params, cut = r.Lookup(indexableName, qclass)
 	}
 
 	if nodeHandlers == nil {
+		var h Handler
+
 		if cut {
 			// no error, but no data
 			if r.NoData != nil {
@@ -270,68 +271,68 @@ func (r *Router) LookupHandler(msg *dns.Msg) (h Handler) {
 	}
 
 	if qtype == dns.TypeANY {
-		h = ParamsHandler(nodeHandlers, params)
+		h := ParamsHandler(nodeHandlers, params)
 		if r.AnyHandler != nil {
 			h = r.AnyHandler(h)
 		}
 		return h
 	}
 
-	var rrsigHandlers NodeHandler
+	var rrsigHandlers, qtypeSig NodeHandler
 	if do && qtype != dns.TypeRRSIG {
 		rrsigHandlers = nodeHandlers.Search(dns.TypeRRSIG)
+		qtypeSig = rrsigHandlers.SearchCovered(qtype)
 	}
 
 	// firstly checks CNAME for non-NSEC requests
 	if !isNsec {
 		if cname := nodeHandlers.Search(dns.TypeCNAME); cname != nil {
-			h = ParamsHandler(cname, params)
-			if cnameSIG := rrsigHandlers.SearchCovered(dns.TypeCNAME); cnameSIG != nil {
-				h = MultipleHandler(h, ParamsHandler(cnameSIG, params))
+			h := ParamsHandler(cname, params)
+			cnameSig := qtypeSig
+			if qtype != dns.TypeCNAME {
+				cnameSig = rrsigHandlers.SearchCovered(dns.TypeCNAME)
 			}
-			if qtype == dns.TypeCNAME {
-				return h
+			if cnameSig != nil {
+				h = MultipleHandler(h, ParamsHandler(cnameSig, params))
 			}
+			// CNAME excludes all other types
+			return h
+		}
+
+		if qtype == dns.TypeCNAME {
+			// fallback
+			qtype = 0
 		}
 	}
 
-	if qtype != dns.TypeCNAME {
-		qtypeSig := rrsigHandlers.SearchCovered(qtype)
+	var (
+		v NodeHandler
+		h Handler
+	)
 
-		if h == nil {
-			var v NodeHandler
-
-		FALLBACK:
-			v = nodeHandlers.Search(qtype)
-			if v == nil {
-				if qtype != 0 {
-					qtype = 0
-					goto FALLBACK
-				}
-
-				// no error, but no data
-				if r.NoData != nil {
-					h = r.NoData
-				} else {
-					h = NoErrorHandler
-				}
-
-				return h
-			}
-
-			h = ParamsHandler(v, params)
+FALLBACK:
+	v = nodeHandlers.Search(qtype)
+	if v == nil {
+		if qtype != 0 {
+			qtype = 0
+			goto FALLBACK
 		}
 
-		if qtypeSig != nil {
-			h = MultipleHandler(h, ParamsHandler(qtypeSig, params))
+		// no error, but no data
+		if r.NoData != nil {
+			h = r.NoData
+		} else {
+			h = NoErrorHandler
 		}
+	} else {
+		h = ParamsHandler(v, params)
 	}
 
-	if h != nil {
-		return h
+	if qtypeSig != nil {
+		h = MultipleHandler(h, ParamsHandler(qtypeSig, params))
 	}
 
-	return RefusedErrorHandler
+	return h
 }
 
 // ServeDNS makes the router implement the Handler interface.

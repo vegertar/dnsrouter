@@ -223,56 +223,9 @@ func CnameHandler(h Handler) Handler {
 			}
 
 			cnameWriter := FurtherRequest(w, req, cname, qtype, h)
-			answer = cnameWriter.Answer
-
 			result.Rcode = cnameWriter.Rcode
 			result.Answer = append(result.Answer, cnameWriter.Answer...)
-		}
-	})
-}
-
-// GlueHandler is a middleware filling out the glue records.
-func GlueHandler(h Handler) Handler {
-	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		h.ServeDNS(w, req)
-
-		if req.Question[0].Qtype != dns.TypeNS {
-			return
-		}
-
-		if result := w.Msg(); result.Rcode == dns.RcodeSuccess {
-			noData := true
-
-			for _, rr := range result.Answer {
-				if rr.Header().Rrtype != dns.TypeNS {
-					continue
-				}
-
-				noData = false
-				ns := rr.(*dns.NS).Ns
-				for _, t := range aReqTypes {
-					glueWriter := FurtherRequest(w, req, ns, t, h)
-					if glueWriter.Rcode == dns.RcodeNameError {
-						break
-					}
-					result.Extra = append(result.Extra, glueWriter.Answer...)
-				}
-			}
-
-			if !noData {
-				result.Authoritative = true
-			}
-		}
-	})
-}
-
-// SoaHandler is a middleware setting authoritative bit.
-func SoaHandler(h Handler) Handler {
-	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		h.ServeDNS(w, req)
-
-		if result := w.Msg(); exists(result.Answer, dns.TypeSOA) {
-			result.Authoritative = true
+			answer = cnameWriter.Answer
 		}
 	})
 }
@@ -290,6 +243,8 @@ func ExtraHandler(h Handler) Handler {
 					target = rr.(*dns.SRV).Target
 				case dns.TypeMX:
 					target = rr.(*dns.MX).Mx
+				case dns.TypeNS:
+					target = rr.(*dns.NS).Ns
 				default:
 					continue
 				}
@@ -309,80 +264,115 @@ func ExtraHandler(h Handler) Handler {
 }
 
 // NxHandler is a middleware filling out a SOA record if occurs NXDOMAIN or NOERROR with no data,
-// as well as filling out NS records for non-NS queries.
+// as well as filling out NS records for non-NS queries. The authoritative field will be set
+// appropriately depending whether the requested owner name is delegated or not.
 func NxHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
 
 		var (
-			msg dns.Msg
-
-			qtype       = req.Question[0].Qtype
-			qname       = req.Question[0].Name
-			result      = w.Msg()
-			offset      = 0
-			rcode       = result.Rcode
-			answer      = result.Answer
-			targetQtype = dns.TypeSOA
-			noData      = true
+			qtype  = req.Question[0].Qtype
+			qname  = req.Question[0].Name
+			result = w.Msg()
+			offset = 0
+			rcode  = result.Rcode
+			answer = result.Answer
 		)
 
-		if qtype == dns.TypeNSEC || qtype == dns.TypeNSEC3 {
+		if rcode != dns.RcodeNameError && rcode != dns.RcodeSuccess ||
+			existsAny(result.Ns, dns.TypeNS, dns.TypeSOA) {
 			return
 		}
 
-		if !(rcode == dns.RcodeNameError ||
-			rcode == dns.RcodeSuccess && !exists(answer, qtype)) {
-			switch qtype {
-			case dns.TypeNS:
-				return
-			case dns.TypeCNAME:
-				if i := last(answer, dns.TypeCNAME); i != -1 {
-					qname, answer = answer[i].(*dns.CNAME).Target, answer[i+1:]
-				}
-			default:
-				if i := firstNotAny(answer,
-					dns.TypeCNAME,
-					dns.TypeRRSIG,
-					dns.TypeNSEC,
-					dns.TypeNSEC3,
-				); i != -1 {
-					qname, answer = answer[i].Header().Name, answer[i:]
-				}
-			}
-			targetQtype = dns.TypeNS
+		if i := firstNotAny(answer,
+			dns.TypeCNAME,
+			dns.TypeRRSIG,
+			dns.TypeNSEC,
+			dns.TypeNSEC3,
+		); i != -1 {
+			qname, answer = answer[i].Header().Name, answer[i:]
 		}
 
-		for {
-			ok := false
-			if rcode == dns.RcodeNameError {
-				offset, _ = dns.NextLabel(qname, offset)
-				ok = true
-			} else if rcode == dns.RcodeSuccess {
-				if noData = !exists(answer, targetQtype); noData {
-					if qtype == targetQtype {
-						offset, _ = dns.NextLabel(qname, offset)
-					} else {
-						qtype = targetQtype
+		var (
+			ns, soa dns.Msg
+			hasData bool
+		)
+
+		defer func() {
+			result.Authoritative = true
+			if len(soa.Answer) == 0 {
+				// delegated
+				result.Authoritative = false
+				result.Answer = nil
+				result.Ns = append(result.Ns, ns.Answer...)
+				result.Extra = append(result.Extra, ns.Extra...)
+				if result.Rcode == dns.RcodeNameError {
+					result.Rcode = dns.RcodeSuccess
+				}
+				if i := first(result.Ns, dns.TypeNS); i != -1 {
+					if opt := req.IsEdns0(); opt != nil && opt.Do() {
+						ds := FurtherRequest(w, req, result.Ns[i].Header().Name, dns.TypeDS, h)
+						result.Ns = append(result.Ns, ds.Answer...)
 					}
-					ok = true
 				}
+			} else if hasData {
+				if qtype != dns.TypeNS {
+					result.Ns = append(result.Ns, ns.Answer...)
+					result.Extra = append(result.Extra, ns.Extra...)
+				}
+			} else {
+				result.Ns = append(result.Ns, soa.Answer...)
+				result.Extra = append(result.Extra, soa.Extra...)
 			}
+		}()
 
-			if !ok || offset >= len(qname) {
-				break
+		if i := first(answer, qtype); i != -1 {
+			hasData = true
+			if qtype == dns.TypeNS {
+				ns.Answer = result.Answer
+				if m := FurtherRequest(w, req, qname, dns.TypeSOA, h); exists(m.Answer, dns.TypeSOA) {
+					soa = m
+				}
+				return
 			}
-
-			msg = FurtherRequest(w, req, qname[offset:], targetQtype, h)
-			rcode, answer = msg.Rcode, msg.Answer
 		}
 
-		if !noData {
-			if msg.Authoritative {
-				result.Authoritative = true
+		if nsOwner, soaOwner := apexFromNsec(result.Ns); nsOwner != "" || soaOwner != "" {
+			if nsOwner != soaOwner && len(nsOwner) > len(soaOwner) {
+				ns = FurtherRequest(w, req, nsOwner, dns.TypeNS, h)
+			} else if !hasData {
+				soa = FurtherRequest(w, req, soaOwner, dns.TypeSOA, h)
 			}
-			result.Ns = append(result.Ns, msg.Answer...)
-			result.Extra = append(result.Extra, msg.Extra...)
+
+			return
+		}
+
+		for i, end := 0, false; !end && len(ns.Answer) == 0; i++ {
+			if rcode == dns.RcodeNameError || i > 0 {
+				offset, end = dns.NextLabel(qname, offset)
+			}
+
+			if !end {
+				name := qname[offset:]
+				if len(ns.Answer) == 0 {
+					m := FurtherRequest(w, req, name, dns.TypeNS, h)
+					if m.Rcode == dns.RcodeNameError {
+						continue
+					}
+					if exists(m.Answer, dns.TypeNS) {
+						ns = m
+					}
+				}
+				if len(soa.Answer) == 0 {
+					m := FurtherRequest(w, req, name, dns.TypeSOA, h)
+					if m.Rcode == dns.RcodeNameError {
+						continue
+					}
+					if exists(m.Answer, dns.TypeSOA) {
+						soa = m
+					}
+				}
+			}
 		}
 	})
 }
@@ -395,8 +385,7 @@ func NsecHandler(h Handler) Handler {
 		q := req.Question[0]
 		result := w.Msg()
 
-		if !(result.Rcode == dns.RcodeNameError ||
-			result.Rcode == dns.RcodeSuccess && !exists(result.Answer, q.Qtype)) {
+		if exists(result.Answer, q.Qtype) {
 			return
 		}
 
@@ -568,9 +557,8 @@ var (
 	DefaultScheme = []Middleware{
 		PanicHandler,
 		OptHandler,
-		NsecHandler,
 		NxHandler,
-		GlueHandler,
+		NsecHandler,
 		ExtraHandler,
 		CnameHandler,
 	}
@@ -581,6 +569,10 @@ var (
 
 func exists(rrSet []dns.RR, t uint16) bool {
 	return first(rrSet, t) != -1
+}
+
+func existsAny(rrSet []dns.RR, t ...uint16) bool {
+	return firstAny(rrSet, t...) != -1
 }
 
 func first(rrSet []dns.RR, t uint16) int {
@@ -601,6 +593,18 @@ func last(rrSet []dns.RR, t uint16) int {
 	return -1
 }
 
+func firstAny(rrSet []dns.RR, t ...uint16) int {
+	for i, rr := range rrSet {
+		rrType := rr.Header().Rrtype
+		for _, j := range t {
+			if j == rrType {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func firstNotAny(rrSet []dns.RR, t ...uint16) int {
 	for i, rr := range rrSet {
 		rrType := rr.Header().Rrtype
@@ -616,6 +620,33 @@ func firstNotAny(rrSet []dns.RR, t ...uint16) int {
 		}
 	}
 	return -1
+}
+
+func apexFromNsec(rrSet []dns.RR) (nsOwner, soaOwner string) {
+	for _, rr := range rrSet {
+		switch rr.Header().Rrtype {
+		case dns.TypeNSEC:
+			nsec := rr.(*dns.NSEC)
+			for _, b := range nsec.TypeBitMap {
+				if nsOwner != "" && soaOwner != "" {
+					return
+				}
+				switch b {
+				case dns.TypeNS:
+					if nsOwner == "" {
+						nsOwner = nsec.Header().Name
+					}
+				case dns.TypeSOA:
+					if soaOwner == "" {
+						soaOwner = nsec.Header().Name
+					}
+				}
+			}
+		case dns.TypeNSEC3:
+			// TODO: supports NSEC3
+		}
+	}
+	return
 }
 
 // see https://gist.github.com/swdunlop/9629168

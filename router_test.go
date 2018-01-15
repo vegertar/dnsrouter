@@ -450,12 +450,12 @@ mx		IN	MX      10 a.miek.nl.`
 	for _, tc := range dnsTestCases {
 		resp := new(responseWriter)
 		req := &Request{Msg: tc.Msg()}
-		ChainHandler(router, NxHandler, ExtraHandler, CnameHandler).ServeDNS(resp, req)
+		ChainHandler(router, DefaultScheme...).ServeDNS(resp, req)
 		sortAndCheck(t, &resp.msg, tc)
 	}
 }
 
-func BenchmarkLookup(b *testing.B) {
+func BenchmarkCnameHandler(b *testing.B) {
 	const s = `
 $TTL    30M
 $ORIGIN miek.nl.
@@ -499,7 +499,7 @@ mx		IN	MX      10 a.miek.nl.`
 	for i := 0; i < b.N; i++ {
 		resp := new(responseWriter)
 		req := &Request{Msg: tc.Msg()}
-		ChainHandler(router, NxHandler, ExtraHandler, CnameHandler).ServeDNS(resp, req)
+		ChainHandler(router, CnameHandler).ServeDNS(resp, req)
 	}
 }
 
@@ -578,7 +578,8 @@ miek.nl.		1800	IN SOA	linode.atoom.net. miek.miek.nl. (
 			1800	DNSKEY	257 3 8 (
 					AwEAAcWdjBl4W4wh/hPxMDcBytmNCvEngIgB
 					9Ut3C2+QI0oVz78/WK9KPoQF7B74JQ/mjO4f
-					vIncBmPp6mFNxs9/WQX0IXf7oKviEVOXLjct
+	
+				vIncBmPp6mFNxs9/WQX0IXf7oKviEVOXLjct
 					R4D1KQLX0wprvtUIsQFIGdXaO6suTT5eDbSd
 					6tTwu5xIkGkDmQhhH8OQydoEuCwV245ZwF/8
 					AIsqBYDNQtQ6zhd6jDC+uZJXg/9LuPOxFHbi
@@ -738,10 +739,8 @@ www.miek.nl.		1800	IN CNAME a.miek.nl.
 				cname("www.miek.nl.	1800	IN	CNAME	a.miek.nl."),
 				rrsig("www.miek.nl. 1800	RRSIG	CNAME 8 3 1800 20160426031301 20160327031301 12051 miek.nl.  NVZmMJaypS+wDL2Lar4Zw1zF"),
 			},
-			Ns: auth,
-			Extra: []dns.RR{
-				opt(4096, true),
-			},
+			Ns:    auth,
+			Extra: []dns.RR{opt(4096, true)},
 		},
 		{
 			// NoData
@@ -880,7 +879,8 @@ miek.nl.		1800	IN SOA	linode.atoom.net. miek.miek.nl. (
 			1800	DNSKEY	257 3 8 (
 					AwEAAcWdjBl4W4wh/hPxMDcBytmNCvEngIgB
 					9Ut3C2+QI0oVz78/WK9KPoQF7B74JQ/mjO4f
-					vIncBmPp6mFNxs9/WQX0IXf7oKviEVOXLjct
+	
+				vIncBmPp6mFNxs9/WQX0IXf7oKviEVOXLjct
 					R4D1KQLX0wprvtUIsQFIGdXaO6suTT5eDbSd
 					6tTwu5xIkGkDmQhhH8OQydoEuCwV245ZwF/8
 					AIsqBYDNQtQ6zhd6jDC+uZJXg/9LuPOxFHbi
@@ -1358,6 +1358,407 @@ a.b.c.miek.nl.		1800	IN A	127.0.0.1
 
 	router := New()
 	router.HandleZone(strings.NewReader(s), "miek.nl.", "stdin")
+
+	for _, tc := range dnsTestCases {
+		resp := new(responseWriter)
+		req := &Request{Msg: tc.Msg()}
+		ChainHandler(router, DefaultScheme...).ServeDNS(resp, req)
+		sortAndCheck(t, &resp.msg, tc)
+	}
+}
+
+func TestLookupDS(t *testing.T) {
+	const s = `
+$TTL    30M
+$ORIGIN miek.nl.
+@       IN      SOA     linode.atoom.net. miek.miek.nl. (
+								1282630057 ; Serial
+								4H         ; Refresh
+								1H         ; Retry
+								7D         ; Expire
+								4H )       ; Negative Cache TTL
+				IN      NS      linode.atoom.net.
+				IN      NS      ns-ext.nlnetlabs.nl.
+				IN      NS      omval.tednet.nl.
+				IN      NS      ext.ns.whyscream.net.
+
+				IN      MX      1  aspmx.l.google.com.
+				IN      MX      5  alt1.aspmx.l.google.com.
+				IN      MX      5  alt2.aspmx.l.google.com.
+				IN      MX      10 aspmx2.googlemail.com.
+				IN      MX      10 aspmx3.googlemail.com.
+
+delegated	IN	NS      a.delegated
+		IN	NS      ns-ext.nlnetlabs.nl.
+
+a.delegated     IN      TXT     "obscured"
+				IN      A       139.162.196.78
+				IN      AAAA    2a01:7e00::f03c:91ff:fef1:6735
+
+a               IN      A       139.162.196.78
+				IN      AAAA    2a01:7e00::f03c:91ff:fef1:6735
+www             IN      CNAME   a
+archive         IN      CNAME   a`
+
+	var dnsTestCases = []testCase{
+		{
+			Qname: "a.delegated.miek.nl.", Qtype: dns.TypeDS,
+			Ns: []dns.RR{
+				ns("delegated.miek.nl.	1800	IN	NS	a.delegated.miek.nl."),
+				ns("delegated.miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+			},
+			Extra: []dns.RR{
+				a("a.delegated.miek.nl. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.miek.nl. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "_udp.delegated.miek.nl.", Qtype: dns.TypeDS,
+			Ns: []dns.RR{
+				ns("delegated.miek.nl.	1800	IN	NS	a.delegated.miek.nl."),
+				ns("delegated.miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+			},
+			Extra: []dns.RR{
+				a("a.delegated.miek.nl. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.miek.nl. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			// This works *here* because we skip the server routing for DS in core/dnsserver/server.go
+			Qname: "_udp.miek.nl.", Qtype: dns.TypeDS,
+			Rcode: dns.RcodeNameError,
+			Ns: []dns.RR{
+				soa("miek.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1282630057 14400 3600 604800 14400"),
+			},
+		},
+		{
+			Qname: "miek.nl.", Qtype: dns.TypeDS,
+			Ns: []dns.RR{
+				soa("miek.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1282630057 14400 3600 604800 14400"),
+			},
+		},
+	}
+
+	router := New()
+	router.HandleZone(strings.NewReader(s), "miek.nl.", "stdin")
+
+	for _, tc := range dnsTestCases {
+		resp := new(responseWriter)
+		req := &Request{Msg: tc.Msg()}
+		ChainHandler(router, DefaultScheme...).ServeDNS(resp, req)
+		sortAndCheck(t, &resp.msg, tc)
+	}
+}
+
+func TestLookupDelegation(t *testing.T) {
+	const s = `
+$TTL    30M
+$ORIGIN miek.nl.
+@       IN      SOA     linode.atoom.net. miek.miek.nl. (
+                             1282630057 ; Serial
+                             4H         ; Refresh
+                             1H         ; Retry
+                             7D         ; Expire
+                             4H )       ; Negative Cache TTL
+                IN      NS      linode.atoom.net.
+                IN      NS      ns-ext.nlnetlabs.nl.
+                IN      NS      omval.tednet.nl.
+                IN      NS      ext.ns.whyscream.net.
+
+                IN      MX      1  aspmx.l.google.com.
+                IN      MX      5  alt1.aspmx.l.google.com.
+                IN      MX      5  alt2.aspmx.l.google.com.
+                IN      MX      10 aspmx2.googlemail.com.
+                IN      MX      10 aspmx3.googlemail.com.
+
+delegated	IN	NS      a.delegated
+		IN	NS      ns-ext.nlnetlabs.nl.
+
+a.delegated     IN      TXT     "obscured"
+                IN      A       139.162.196.78
+                IN      AAAA    2a01:7e00::f03c:91ff:fef1:6735
+
+a               IN      A       139.162.196.78
+                IN      AAAA    2a01:7e00::f03c:91ff:fef1:6735
+www             IN      CNAME   a
+archive         IN      CNAME   a`
+
+	var miekAuth = []dns.RR{
+		ns("miek.nl.	1800	IN	NS	ext.ns.whyscream.net."),
+		ns("miek.nl.	1800	IN	NS	linode.atoom.net."),
+		ns("miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+		ns("miek.nl.	1800	IN	NS	omval.tednet.nl."),
+	}
+
+	var dnsTestCases = []testCase{
+		{
+			Qname: "a.delegated.miek.nl.", Qtype: dns.TypeTXT,
+			Ns: []dns.RR{
+				ns("delegated.miek.nl.	1800	IN	NS	a.delegated.miek.nl."),
+				ns("delegated.miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+			},
+			Extra: []dns.RR{
+				a("a.delegated.miek.nl. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.miek.nl. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "delegated.miek.nl.", Qtype: dns.TypeNS,
+			Ns: []dns.RR{
+				ns("delegated.miek.nl.	1800	IN	NS	a.delegated.miek.nl."),
+				ns("delegated.miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+			},
+			Extra: []dns.RR{
+				a("a.delegated.miek.nl. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.miek.nl. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "foo.delegated.miek.nl.", Qtype: dns.TypeA,
+			Ns: []dns.RR{
+				ns("delegated.miek.nl.	1800	IN	NS	a.delegated.miek.nl."),
+				ns("delegated.miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+			},
+			Extra: []dns.RR{
+				a("a.delegated.miek.nl. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.miek.nl. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "foo.delegated.miek.nl.", Qtype: dns.TypeTXT,
+			Ns: []dns.RR{
+				ns("delegated.miek.nl.	1800	IN	NS	a.delegated.miek.nl."),
+				ns("delegated.miek.nl.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+			},
+			Extra: []dns.RR{
+				a("a.delegated.miek.nl. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.miek.nl. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "miek.nl.", Qtype: dns.TypeSOA,
+			Answer: []dns.RR{
+				soa("miek.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1282630057 14400 3600 604800 14400"),
+			},
+			Ns: miekAuth,
+		},
+		{
+			Qname: "miek.nl.", Qtype: dns.TypeAAAA,
+			Ns: []dns.RR{
+				soa("miek.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1282630057 14400 3600 604800 14400"),
+			},
+		},
+	}
+
+	router := New()
+	router.HandleZone(strings.NewReader(s), "miek.nl.", "stdin")
+
+	for _, tc := range dnsTestCases {
+		resp := new(responseWriter)
+		req := &Request{Msg: tc.Msg()}
+		ChainHandler(router, DefaultScheme...).ServeDNS(resp, req)
+		sortAndCheck(t, &resp.msg, tc)
+	}
+}
+
+func TestLookupSecureDelegation(t *testing.T) {
+	const s = `
+example.org.		1800	IN SOA	a.iana-servers.net. devnull.example.org. (
+					1282630057 ; serial
+					14400      ; refresh (4 hours)
+					3600       ; retry (1 hour)
+					604800     ; expire (1 week)
+					14400      ; minimum (4 hours)
+					)
+			1800	RRSIG	SOA 13 2 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					GVnMpFmN+6PDdgCtlYDEYBsnBNDgYmEJNvos
+					Bk9+PNTPNWNst+BXCpDadTeqRwrr1RHEAQ7j
+					YWzNwqn81pN+IA== )
+			1800	NS	a.iana-servers.net.
+			1800	NS	b.iana-servers.net.
+			1800	RRSIG	NS 13 2 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					llrHoIuwjnbo28LOt4p5zWAs98XGqrXicKVI
+					Qxyaf/ORM8boJvW2XrKr3nj6Y8FKMhzd287D
+					5PBzVCL6MZyjQg== )
+			14400	NSEC	a.example.org. NS SOA RRSIG NSEC DNSKEY
+			14400	RRSIG	NSEC 13 2 14400 (
+					20161129153240 20161030153240 49035 example.org.
+					BQROf1swrmYi3GqpP5M/h5vTB8jmJ/RFnlaX
+					7fjxvV7aMvXCsr3ekWeB2S7L6wWFihDYcKJg
+					9BxVPqxzBKeaqg== )
+			1800	DNSKEY	256 3 13 (
+					UNTqlHbC51EbXuY0rshW19Iz8SkCuGVS+L0e
+					bQj53dvtNlaKfWmtTauC797FoyVLbQwoMy/P
+					G68SXgLCx8g+9g==
+					) ; ZSK; alg = ECDSAP256SHA256; key id = 49035
+			1800	RRSIG	DNSKEY 13 2 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					LnLHyqYJaCMOt7EHB4GZxzAzWLwEGCTFiEhC
+					jj1X1VuQSjJcN42Zd3yF+jihSW6huknrig0Z
+					Mqv0FM6mJ/qPKg== )
+a.delegated.example.org. 1800	IN A	139.162.196.78
+			1800	TXT	"obscured"
+			1800	AAAA	2a01:7e00::f03c:91ff:fef1:6735
+archive.example.org.	1800	IN CNAME a.example.org.
+			1800	RRSIG	CNAME 13 3 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					SDFW1z/PN9knzH8BwBvmWK0qdIwMVtGrMgRw
+					7lgy4utRrdrRdCSLZy3xpkmkh1wehuGc4R0S
+					05Z3DPhB0Fg5BA== )
+			14400	NSEC	delegated.example.org. CNAME RRSIG NSEC
+			14400	RRSIG	NSEC 13 3 14400 (
+					20161129153240 20161030153240 49035 example.org.
+					DQqLSVNl8F6v1K09wRU6/M6hbHy2VUddnOwn
+					JusJjMlrAOmoOctCZ/N/BwqCXXBA+d9yFGdH
+					knYumXp+BVPBAQ== )
+www.example.org.	1800	IN CNAME a.example.org.
+			1800	RRSIG	CNAME 13 3 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					adzujOxCV0uBV4OayPGfR11iWBLiiSAnZB1R
+					slmhBFaDKOKSNYijGtiVPeaF+EuZs63pzd4y
+					6Nm2Iq9cQhAwAA== )
+			14400	NSEC	example.org. CNAME RRSIG NSEC
+			14400	RRSIG	NSEC 13 3 14400 (
+					20161129153240 20161030153240 49035 example.org.
+					jy3f96GZGBaRuQQjuqsoP1YN8ObZF37o+WkV
+					PL7TruzI7iNl0AjrUDy9FplP8Mqk/HWyvlPe
+					N3cU+W8NYlfDDQ== )
+a.example.org.		1800	IN A	139.162.196.78
+			1800	RRSIG	A 13 3 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					41jFz0Dr8tZBN4Kv25S5dD4vTmviFiLx7xSA
+					qMIuLFm0qibKL07perKpxqgLqM0H1wreT4xz
+					I9Y4Dgp1nsOuMA== )
+			1800	AAAA	2a01:7e00::f03c:91ff:fef1:6735
+			1800	RRSIG	AAAA 13 3 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					brHizDxYCxCHrSKIu+J+XQbodRcb7KNRdN4q
+					VOWw8wHqeBsFNRzvFF6jwPQYphGP7kZh1KAb
+					VuY5ZVVhM2kHjw== )
+			14400	NSEC	archive.example.org. A AAAA RRSIG NSEC
+			14400	RRSIG	NSEC 13 3 14400 (
+					20161129153240 20161030153240 49035 example.org.
+					zIenVlg5ScLr157EWigrTGUgrv7W/1s49Fic
+					i2k+OVjZfT50zw+q5X6DPKkzfAiUhIuqs53r
+					hZUzZwV/1Wew9Q== )
+delegated.example.org.	1800	IN NS	a.delegated.example.org.
+			1800	IN NS	ns-ext.nlnetlabs.nl.
+			1800	DS	10056 5 1 (
+					EE72CABD1927759CDDA92A10DBF431504B9E
+					1F13 )
+			1800	DS	10056 5 2 (
+					E4B05F87725FA86D9A64F1E53C3D0E625094
+					6599DFE639C45955B0ED416CDDFA )
+			1800	RRSIG	DS 13 3 1800 (
+					20161129153240 20161030153240 49035 example.org.
+					rlNNzcUmtbjLSl02ZzQGUbWX75yCUx0Mug1j
+					HtKVqRq1hpPE2S3863tIWSlz+W9wz4o19OI4
+					jbznKKqk+DGKog== )
+			14400	NSEC	sub.example.org. NS DS RRSIG NSEC
+			14400	RRSIG	NSEC 13 3 14400 (
+					20161129153240 20161030153240 49035 example.org.
+					lNQ5kRTB26yvZU5bFn84LYFCjwWTmBcRCDbD
+					cqWZvCSw4LFOcqbz1/wJKIRjIXIqnWIrfIHe
+					fZ9QD5xZsrPgUQ== )
+sub.example.org.	1800	IN NS	sub1.example.net.
+			1800	IN NS	sub2.example.net.
+			14400	NSEC	www.example.org. NS RRSIG NSEC
+			14400	RRSIG	NSEC 13 3 14400 (
+					20161129153240 20161030153240 49035 example.org.
+					VYjahdV+TTkA3RBdnUI0hwXDm6U5k/weeZZr
+					ix1znORpOELbeLBMJW56cnaG+LGwOQfw9qqj
+					bOuULDst84s4+g== )
+`
+
+	var dnsTestCases = []testCase{
+		{
+			Qname: "a.delegated.example.org.", Qtype: dns.TypeTXT,
+			Do: true,
+			Ns: []dns.RR{
+				ds("delegated.example.org.	1800	IN	DS	10056 5 1 EE72CABD1927759CDDA92A10DBF431504B9E1F13"),
+				ds("delegated.example.org.	1800	IN	DS	10056 5 2 E4B05F87725FA86D9A64F1E53C3D0E6250946599DFE639C45955B0ED416CDDFA"),
+				ns("delegated.example.org.	1800	IN	NS	a.delegated.example.org."),
+				ns("delegated.example.org.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+				rrsig("delegated.example.org.	1800	IN	RRSIG	DS 13 3 1800 20161129153240 20161030153240 49035 example.org. rlNNzcUmtbjLSl02ZzQGUbWX75yCUx0Mug1jHtKVqRq1hpPE2S3863tIWSlz+W9wz4o19OI4jbznKKqk+DGKog=="),
+			},
+			Extra: []dns.RR{
+				opt(4096, true),
+				a("a.delegated.example.org. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.example.org. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		/*{
+			Qname: "delegated.example.org.", Qtype: dns.TypeNS,
+			Do: true,
+			Ns: []dns.RR{
+				ds("delegated.example.org.	1800	IN	DS	10056 5 1 EE72CABD1927759CDDA92A10DBF431504B9E1F13"),
+				ds("delegated.example.org.	1800	IN	DS	10056 5 2 E4B05F87725FA86D9A64F1E53C3D0E6250946599DFE639C45955B0ED416CDDFA"),
+				ns("delegated.example.org.	1800	IN	NS	a.delegated.example.org."),
+				ns("delegated.example.org.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+				rrsig("delegated.example.org.	1800	IN	RRSIG	DS 13 3 1800 20161129153240 20161030153240 49035 example.org. rlNNzcUmtbjLSl02ZzQGUbWX75yCUx0Mug1jHtKVqRq1hpPE2S3863tIWSlz+W9wz4o19OI4jbznKKqk+DGKog=="),
+			},
+			Extra: []dns.RR{
+				opt(4096, true),
+				a("a.delegated.example.org. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.example.org. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "foo.delegated.example.org.", Qtype: dns.TypeA,
+			Do: true,
+			Ns: []dns.RR{
+				ds("delegated.example.org.	1800	IN	DS	10056 5 1 EE72CABD1927759CDDA92A10DBF431504B9E1F13"),
+				ds("delegated.example.org.	1800	IN	DS	10056 5 2 E4B05F87725FA86D9A64F1E53C3D0E6250946599DFE639C45955B0ED416CDDFA"),
+				ns("delegated.example.org.	1800	IN	NS	a.delegated.example.org."),
+				ns("delegated.example.org.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+				rrsig("delegated.example.org.	1800	IN	RRSIG	DS 13 3 1800 20161129153240 20161030153240 49035 example.org. rlNNzcUmtbjLSl02ZzQGUbWX75yCUx0Mug1jHtKVqRq1hpPE2S3863tIWSlz+W9wz4o19OI4jbznKKqk+DGKog=="),
+			},
+			Extra: []dns.RR{
+				opt(4096, true),
+				a("a.delegated.example.org. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.example.org. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "foo.delegated.example.org.", Qtype: dns.TypeDS,
+			Do: true,
+			Ns: []dns.RR{
+				ds("delegated.example.org.	1800	IN	DS	10056 5 1 EE72CABD1927759CDDA92A10DBF431504B9E1F13"),
+				ds("delegated.example.org.	1800	IN	DS	10056 5 2 E4B05F87725FA86D9A64F1E53C3D0E6250946599DFE639C45955B0ED416CDDFA"),
+				ns("delegated.example.org.	1800	IN	NS	a.delegated.example.org."),
+				ns("delegated.example.org.	1800	IN	NS	ns-ext.nlnetlabs.nl."),
+				rrsig("delegated.example.org.	1800	IN	RRSIG	DS 13 3 1800 20161129153240 20161030153240 49035 example.org. rlNNzcUmtbjLSl02ZzQGUbWX75yCUx0Mug1jHtKVqRq1hpPE2S3863tIWSlz+W9wz4o19OI4jbznKKqk+DGKog=="),
+			},
+			Extra: []dns.RR{
+				opt(4096, true),
+				a("a.delegated.example.org. 1800 IN A 139.162.196.78"),
+				aaaa("a.delegated.example.org. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
+			},
+		},
+		{
+			Qname: "delegated.example.org.", Qtype: dns.TypeDS,
+			Do: true,
+			Answer: []dns.RR{
+				ds("delegated.example.org.	1800	IN	DS	10056 5 1 EE72CABD1927759CDDA92A10DBF431504B9E1F13"),
+				ds("delegated.example.org.	1800	IN	DS	10056 5 2 E4B05F87725FA86D9A64F1E53C3D0E6250946599DFE639C45955B0ED416CDDFA"),
+				rrsig("delegated.example.org.	1800	IN	RRSIG	DS 13 3 1800 20161129153240 20161030153240 49035 example.org. rlNNzcUmtbjLSl02ZzQGUbWX75yCUx0Mug1jHtKVqRq1hpPE2S3863tIWSlz+W9wz4o19OI4jbznKKqk+DGKog=="),
+			},
+			Ns: []dns.RR{
+				ns("example.org.	1800	IN	NS	a.iana-servers.net."),
+				ns("example.org.	1800	IN	NS	b.iana-servers.net."),
+				rrsig("example.org.	1800	IN	RRSIG	NS 13 2 1800 20161129153240 20161030153240 49035 example.org. llrHoIuw="),
+			},
+			Extra: []dns.RR{
+				opt(4096, true),
+			},
+		},
+		*/
+	}
+
+	router := New()
+	router.HandleZone(strings.NewReader(s), "example.org.", "stdin")
 
 	for _, tc := range dnsTestCases {
 		resp := new(responseWriter)
