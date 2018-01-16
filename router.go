@@ -10,9 +10,11 @@ import (
 	"github.com/miekg/dns"
 )
 
-const wildcardDomainPlaceholder = ":1"
+const wildcardDomainPlaceholder = "*1"
 
 type paramContextKeyType string
+
+const paramContextKey paramContextKeyType = "params"
 
 // Param is a single domain parameter, consisting of a key and a value.
 type Param struct {
@@ -54,6 +56,7 @@ type Router struct {
 	NoData Handler
 
 	// Configurable middleware which is used when comes a query with type ANY.
+	// If it is not set, defaults to output all records.
 	AnyHandler Middleware
 }
 
@@ -136,7 +139,7 @@ func (r *Router) handle(name string, qclass, qtype, typeCovered uint16, handler 
 
 	trees := r.trees
 
-	// especially, convert wild card domain to placeholder ":1" with rest of labels,
+	// especially, convert wild card domain to placeholder "*1" with rest of labels,
 	// and insert result into the wildcardTrees
 	if strings.HasPrefix(name, "*.") {
 		trees = r.wildcardTrees
@@ -149,7 +152,7 @@ func (r *Router) handle(name string, qclass, qtype, typeCovered uint16, handler 
 		trees[qclass] = root
 	}
 
-	indexableName := IndexableName(name)
+	indexableName := newIndexableName(name)
 	root.addRoute(indexableName, true, nodeHandlerElement{
 		Qtype:       qtype,
 		TypeCovered: typeCovered,
@@ -171,11 +174,11 @@ func (r *Router) nsecPrevious(name string, qclass, qtype uint16) (indexableName 
 	switch qtype {
 	case dns.TypeNSEC3:
 		if r.nsec3Names != nil {
-			return r.nsec3Names[qclass].Previous(IndexableName(name))
+			return r.nsec3Names[qclass].Previous(newIndexableName(name))
 		}
 	case dns.TypeNSEC:
 		if r.nsecNames != nil {
-			return r.nsecNames[qclass].Previous(IndexableName(name))
+			return r.nsecNames[qclass].Previous(newIndexableName(name))
 		}
 	}
 	return
@@ -187,21 +190,28 @@ func (r *Router) nsecPrevious(name string, qclass, qtype uint16) (indexableName 
 // and the name parameter values.
 // Otherwise, the third boolean value indicating whether the name is a cut
 // that stopping by '.' within searching path.
-func (r *Router) Lookup(name string, qclass uint16) (NodeHandler, Params, bool) {
-	name = IndexableName(name)
+func (r *Router) Lookup(name string, qclass uint16) (h NodeHandler, params Params, cut bool) {
+	name = newIndexableName(name)
+
+	defer func() {
+		// reverse params to against the original name
+		for i, j := 0, len(params)-1; i < j; i, j = i+1, j-1 {
+			params[i], params[j] = params[j], params[i]
+		}
+	}()
 
 FALLBACK:
 	if root := r.trees[qclass]; root != nil {
-		v, params, cut := root.getValue(name)
-		if v != nil || cut {
-			return v, params, cut
+		h, params, cut = root.getValue(name)
+		if h != nil || cut {
+			return
 		}
 	}
 
 	if root := r.wildcardTrees[qclass]; root != nil {
-		v, params, cut := root.getValue(name)
-		if v != nil || cut {
-			return v, params, cut
+		h, params, cut = root.getValue(name)
+		if h != nil || cut {
+			return
 		}
 	}
 
@@ -217,7 +227,7 @@ FALLBACK:
 // which is either dns.TypeNSEC or dns.TypeNSEC3.
 func (r *Router) LookupNSEC(name string, qclass, qtype uint16) (NodeHandler, Params, bool) {
 	// TODO: supports NSEC3
-	name = IndexableName(name)
+	name = newIndexableName(name)
 	if previousName, found := r.nsecPrevious(name, qclass, qtype); previousName != "" {
 		if !found {
 			name = previousName
@@ -235,7 +245,7 @@ func (r *Router) LookupHandler(msg *dns.Msg) Handler {
 	opt := msg.IsEdns0()
 	do := opt != nil && opt.Do()
 	isNsec := qtype == dns.TypeNSEC || qtype == dns.TypeNSEC3
-	indexableName := IndexableName(dns.Fqdn(q.Name))
+	indexableName := newIndexableName(q.Name)
 
 	var (
 		nodeHandlers NodeHandler
@@ -355,19 +365,9 @@ func (r *Router) ServeDNS(w ResponseWriter, req *Request) {
 	r.LookupHandler(req.Msg).ServeDNS(w, req)
 }
 
-// IndexableName returns a name for indexing.
-func IndexableName(name string) string {
+func newIndexableName(name string) string {
 	if !isIndexable(name) {
-		name = indexableString(dns.Fqdn(name))
-	}
-	return name
-}
-
-// UnindexableName reverts indexable name to original name.
-func UnindexableName(name string) string {
-	if isIndexable(name) {
-		// reversing again
-		name = indexableString(name)
+		name = indexable(dns.Fqdn(name))
 	}
 	return name
 }
@@ -376,7 +376,7 @@ func isIndexable(s string) bool {
 	return s != "" && s[0] == '.'
 }
 
-func indexableString(s string) string {
+func indexable(s string) string {
 	if len(s) <= 1 {
 		return s
 	}

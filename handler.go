@@ -2,7 +2,6 @@ package dnsrouter
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -39,13 +38,12 @@ type Request struct {
 	ctx context.Context
 }
 
-// Param returns the value paired with the given name.
-func (r *Request) Param(name string) string {
-	var value string
-	if v := r.Context().Value(paramContextKeyType(name)); v != nil {
-		value, _ = v.(string)
+// Params returns the binding params.
+func (r *Request) Params() Params {
+	if v := r.Context().Value(paramContextKey); v != nil {
+		return v.(Params)
 	}
-	return value
+	return nil
 }
 
 // Context returns the request's context. To change the context, use WithContext.
@@ -121,23 +119,11 @@ func (e RcodeHandler) ServeDNS(w ResponseWriter, r *Request) {
 }
 
 var (
-	// ErrResponseWritten resulted from writting a written response.
-	ErrResponseWritten = errors.New("response has been written")
-
 	// NoErrorHandler responses dns.RcodeSuccess.
 	NoErrorHandler = RcodeHandler(dns.RcodeSuccess)
 
 	// NameErrorHandler responses dns.RcodeNameError.
 	NameErrorHandler = RcodeHandler(dns.RcodeNameError)
-
-	// FormatErrorHandler responses dns.RcodeFormatError.
-	FormatErrorHandler = RcodeHandler(dns.RcodeFormatError)
-
-	// RefusedErrorHandler responses dns.RcodeRefused.
-	RefusedErrorHandler = RcodeHandler(dns.RcodeRefused)
-
-	// FailureErrorHandler responses dns.RcodeServerFailure.
-	FailureErrorHandler = RcodeHandler(dns.RcodeServerFailure)
 )
 
 var (
@@ -150,51 +136,8 @@ func ParamsHandler(h Handler, params Params) Handler {
 		return h
 	}
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		ctx := req.Context()
-		for _, item := range params {
-			ctx = context.WithValue(ctx, paramContextKeyType(item.Key), item.Value)
-		}
-		req = req.WithContext(ctx)
-		h.ServeDNS(w, req)
-	})
-}
-
-// SwapDirection defines a direction of swapping two sections.
-type SwapDirection int
-
-const (
-	// NsWithAnswer swapping sections between NS and ANSWER.
-	NsWithAnswer SwapDirection = iota
-
-	// NsWithExtra swapping sections between NS and ADDITIONAL.
-	NsWithExtra
-
-	// AnswerWithExtra swapping sections between ANSWER and ADDITIONAL.
-	AnswerWithExtra
-)
-
-// SwapHandler swaps out sections via given directions if h serve successfully.
-func SwapHandler(h Handler, directions ...SwapDirection) Handler {
-	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		q := req.Question[0]
-		msg := FurtherRequest(w, req, q.Name, q.Qtype, h)
-		if msg.Rcode == dns.RcodeSuccess {
-			for _, d := range directions {
-				switch d {
-				case NsWithAnswer:
-					msg.Ns, msg.Answer = msg.Answer, msg.Ns
-				case NsWithExtra:
-					msg.Ns, msg.Extra = msg.Extra, msg.Ns
-				case AnswerWithExtra:
-					msg.Answer, msg.Extra = msg.Extra, msg.Answer
-				}
-			}
-		}
-
-		result := w.Msg()
-		result.Answer = append(result.Answer, msg.Answer...)
-		result.Ns = append(result.Ns, msg.Ns...)
-		result.Extra = append(result.Extra, msg.Extra...)
+		ctx := context.WithValue(req.Context(), paramContextKey, params)
+		h.ServeDNS(w, req.WithContext(ctx))
 	})
 }
 
@@ -222,7 +165,7 @@ func CnameHandler(h Handler) Handler {
 				break
 			}
 
-			cnameWriter := FurtherRequest(w, req, cname, qtype, h)
+			cnameWriter := FurtherRequest(w, req, cname, qtype, WildcardHandler(h))
 			result.Rcode = cnameWriter.Rcode
 			result.Answer = append(result.Answer, cnameWriter.Answer...)
 			answer = cnameWriter.Answer
@@ -406,7 +349,7 @@ func NxHandler(h Handler) Handler {
 
 		for i, end := 0, false; !end && len(ns.Answer) == 0; i++ {
 			if rcode == dns.RcodeNameError || // directly go up when NXDOMAIN
-				hasData && qtype == dns.TypeDS || // always go up for delegation
+				hasData && qtype == dns.TypeDS || // always go up when delegated
 				i > 0 { // go up from 2nd iteration when NOERROR but no data
 				offset, end = dns.NextLabel(qname, offset)
 			}
@@ -433,6 +376,15 @@ func NxHandler(h Handler) Handler {
 				}
 			}
 		}
+	})
+}
+
+// WildcardHandler is a middleware expanding wildcard.
+func WildcardHandler(h Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		h.ServeDNS(w, req)
+
+		expandWildcard(w.Msg(), req.Question[0].Name)
 	})
 }
 
@@ -481,26 +433,15 @@ func PanicHandler(h Handler) Handler {
 		defer func() {
 			if v := recover(); v != nil {
 				txt := new(dns.TXT)
-				txt.Hdr.Name = "panic." + req.Question[0].Name
+				txt.Hdr.Name = req.Question[0].Name
 				txt.Hdr.Class = req.Question[0].Qclass
 				txt.Hdr.Rrtype = dns.TypeTXT
-				txt.Txt = []string{fmt.Sprint(v), identifyPanic()}
+				txt.Txt = []string{"panic", fmt.Sprint(v), identifyPanic()}
 
 				result := w.Msg()
 				result.Rcode = dns.RcodeServerFailure
 				result.Extra = append(result.Extra, txt)
 			}
-		}()
-
-		h.ServeDNS(w, req)
-	})
-}
-
-// LoggingHandler is a middleware logging requests.
-func LoggingHandler(h Handler) Handler {
-	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		defer func() {
-			// TODO:
 		}()
 
 		h.ServeDNS(w, req)
@@ -545,10 +486,10 @@ func FurtherRequest(w ResponseWriter, req *Request, qname string, qtype uint16, 
 }
 
 // Classic returns a github.com/miekg/dns.Handler.
-// If middlewares is nil, then use DefaultLoggingScheme.
+// If middlewares is nil, then use DefaultScheme.
 func Classic(ctx context.Context, h Handler, middlewares ...Middleware) dns.Handler {
 	if middlewares == nil {
-		middlewares = DefaultLoggingScheme
+		middlewares = DefaultScheme
 	}
 	h = ChainHandler(h, middlewares...)
 
@@ -568,14 +509,12 @@ var (
 		PanicHandler,
 		RefusedHandler,
 		OptHandler,
+		WildcardHandler,
 		NxHandler,
 		NsecHandler,
 		ExtraHandler,
 		CnameHandler,
 	}
-
-	// DefaultLoggingScheme consists of LoggingHandler and DefaultScheme.
-	DefaultLoggingScheme = append([]Middleware{LoggingHandler}, DefaultScheme...)
 )
 
 func exists(rrSet []dns.RR, t uint16) bool {
@@ -589,15 +528,6 @@ func existsAny(rrSet []dns.RR, t ...uint16) bool {
 func first(rrSet []dns.RR, t uint16) int {
 	for i, rr := range rrSet {
 		if rr.Header().Rrtype == t {
-			return i
-		}
-	}
-	return -1
-}
-
-func last(rrSet []dns.RR, t uint16) int {
-	for i := len(rrSet) - 1; i >= 0; i-- {
-		if rrSet[i].Header().Rrtype == t {
 			return i
 		}
 	}
@@ -639,9 +569,6 @@ func apexFromNsec(rrSet []dns.RR) (nsOwner, soaOwner string) {
 		case dns.TypeNSEC:
 			nsec := rr.(*dns.NSEC)
 			for _, b := range nsec.TypeBitMap {
-				if nsOwner != "" && soaOwner != "" {
-					return
-				}
 				switch b {
 				case dns.TypeNS:
 					if nsOwner == "" {
@@ -651,13 +578,37 @@ func apexFromNsec(rrSet []dns.RR) (nsOwner, soaOwner string) {
 					if soaOwner == "" {
 						soaOwner = nsec.Header().Name
 					}
+				case dns.TypeDS:
+					nsOwner = ""
+					soaOwner = ""
 				}
 			}
 		case dns.TypeNSEC3:
 			// TODO: supports NSEC3
 		}
+
+		if nsOwner != "" && soaOwner != "" {
+			return
+		}
 	}
 	return
+}
+
+func expandWildcard(result *dns.Msg, qname string) {
+	if len(result.Answer) == 0 {
+		return
+	}
+
+	name := result.Answer[0].Header().Name
+	if !strings.HasPrefix(name, "*") && !strings.Contains(name, ":") {
+		return
+	}
+
+	for i, rr := range result.Answer {
+		rr = dns.Copy(rr)
+		rr.Header().Name = qname
+		result.Answer[i] = rr
+	}
 }
 
 // see https://gist.github.com/swdunlop/9629168
