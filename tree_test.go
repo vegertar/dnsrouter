@@ -41,7 +41,7 @@ type testRequests []struct {
 	cut        bool
 }
 
-func checkRequests(t *testing.T, tree *node, requests testRequests) {
+func checkRequests(t *testing.T, tree tree, requests testRequests) {
 	for _, request := range requests {
 		handler, ps, cut := tree.getValue(request.name)
 
@@ -244,6 +244,7 @@ func TestTreeWildcardConflict(t *testing.T) {
 	routes := []testRoute{
 		{".cmd.:tool.:sub", false},
 		{".cmd.vet", true},
+		{".src", false},
 		{".src.*filename", false},
 		{".src.*filenamex", true},
 		{".src.", true},

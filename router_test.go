@@ -29,7 +29,14 @@ func TestCanonicalOrder(t *testing.T) {
 		"z.example.",
 		"\001.z.example.",
 		"*.z.example.",
+		"*_.c.b.a.z.example.",
 		"\200.z.example.",
+		":_.z.example.",
+		"a.:_.z.example.",
+		"b.:_.z.example.",
+		"c.b.:_.z.example.",
+		"*_.c.b.:_.z.example.",
+		"*_.z.example.",
 	}
 
 	names := make([]string, 0, len(input))
@@ -53,6 +60,9 @@ func TestCanonicalOrder(t *testing.T) {
 	}
 	if s, found := order.Previous(".example"); !found {
 		t.Error(".example: should be found, got", s)
+	}
+	if s, found := order.Previous(".example.z.a.b.c.d"); found || s != ".example.z.*" {
+		t.Error(".example.z.a.b.c.d: should follow \"*.z.example.\", got", s)
 	}
 
 	revert := make([]string, 0, len(order))
@@ -326,7 +336,7 @@ external        IN      CNAME   www.example.net.`
 	for _, tc := range cnameTestCases {
 		resp := new(responseWriter)
 		req := &Request{Msg: tc.Msg()}
-		ChainHandler(router, NxHandler, ExtraHandler, CnameHandler).ServeDNS(resp, req)
+		ChainHandler(router, NxHandler, CnameHandler).ServeDNS(resp, req)
 		sortAndCheck(t, &resp.msg, tc)
 	}
 }
@@ -507,7 +517,7 @@ mx		IN	MX      10 a.miek.nl.`
 	for i := 0; i < b.N; i++ {
 		resp := new(responseWriter)
 		req := &Request{Msg: tc.Msg()}
-		ChainHandler(router, CnameHandler).ServeDNS(resp, req)
+		ChainHandler(router, DefaultScheme...).ServeDNS(resp, req)
 	}
 }
 
@@ -1007,6 +1017,7 @@ www.miek.nl.		1800	IN CNAME a.miek.nl.
 			rrsig("miek.nl.	1800	IN	RRSIG	SOA 8 2 1800 20160426031301 20160327031301 12051 miek.nl. FIrzy07acBbtyQczy1dc="),
 			soa("miek.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1282630057 14400 3600 604800 14400"),
 		},
+		Extra: []dns.RR{opt(4096, true)},
 	}
 
 	b.ResetTimer()
@@ -1946,52 +1957,48 @@ a.dnssex.nl.		1800	IN A	139.162.196.78
 			},
 			Ns: dnssexAuth[:len(dnssexAuth)-1], // remove RRSIG on the end
 		},
-		/*
-			{
-				Qname: "wild.dnssex.nl.", Qtype: dns.TypeTXT, Do: true,
-				Answer: []dns.RR{
-					rrsig("wild.dnssex.nl.	1800	IN	RRSIG	TXT 8 2 1800 20160428190224 20160329190224 14460 dnssex.nl. FUZSTyvZfeuuOpCm"),
-					txt(`wild.dnssex.nl.	1800	IN	TXT	"Doing It Safe Is Better"`),
-				},
-				Ns: append([]dns.RR{
-					nsec("a.dnssex.nl.	14400	IN	NSEC	www.dnssex.nl. A AAAA RRSIG NSEC"),
-					rrsig("a.dnssex.nl.	14400	IN	RRSIG	NSEC 8 3 14400 20160428190224 20160329190224 14460 dnssex.nl. S+UMs2ySgRaaRY"),
-				}, dnssexAuth...),
-				Extra: []dns.RR{opt(4096, true)},
+		{
+			Qname: "wild.dnssex.nl.", Qtype: dns.TypeTXT, Do: true,
+			Answer: []dns.RR{
+				rrsig("wild.dnssex.nl.	1800	IN	RRSIG	TXT 8 2 1800 20160428190224 20160329190224 14460 dnssex.nl. FUZSTyvZfeuuOpCm"),
+				txt(`wild.dnssex.nl.	1800	IN	TXT	"Doing It Safe Is Better"`),
 			},
-		*/
-		/*
-			{
-				Qname: "a.wild.dnssex.nl.", Qtype: dns.TypeTXT, Do: true,
-				Answer: []dns.RR{
-					rrsig("a.wild.dnssex.nl.	1800	IN	RRSIG	TXT 8 2 1800 20160428190224 20160329190224 14460 dnssex.nl. FUZSTyvZfeuuOpCm"),
-					txt(`a.wild.dnssex.nl.	1800	IN	TXT	"Doing It Safe Is Better"`),
-				},
-				Ns: append([]dns.RR{
-					nsec("a.dnssex.nl.	14400	IN	NSEC	www.dnssex.nl. A AAAA RRSIG NSEC"),
-					rrsig("a.dnssex.nl.	14400	IN	RRSIG	NSEC 8 3 14400 20160428190224 20160329190224 14460 dnssex.nl. S+UMs2ySgRaaRY"),
-				}, dnssexAuth...),
-				Extra: []dns.RR{opt(4096, true)},
+			Ns: append([]dns.RR{
+				nsec("a.dnssex.nl.	14400	IN	NSEC	www.dnssex.nl. A AAAA RRSIG NSEC"),
+				rrsig("a.dnssex.nl.	14400	IN	RRSIG	NSEC 8 3 14400 20160428190224 20160329190224 14460 dnssex.nl. S+UMs2ySgRaaRY"),
+			}, dnssexAuth...),
+			Extra: []dns.RR{opt(4096, true)},
+		},
+		{
+			Qname: "a.wild.dnssex.nl.", Qtype: dns.TypeTXT, Do: true,
+			Answer: []dns.RR{
+				rrsig("a.wild.dnssex.nl.	1800	IN	RRSIG	TXT 8 2 1800 20160428190224 20160329190224 14460 dnssex.nl. FUZSTyvZfeuuOpCm"),
+				txt(`a.wild.dnssex.nl.	1800	IN	TXT	"Doing It Safe Is Better"`),
 			},
-			// nodata responses
-			{
-				Qname: "wild.dnssex.nl.", Qtype: dns.TypeSRV,
-				Ns: []dns.RR{
-					soa(`dnssex.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1459281744 14400 3600 604800 14400`),
-				},
+			Ns: append([]dns.RR{
+				nsec("a.dnssex.nl.	14400	IN	NSEC	www.dnssex.nl. A AAAA RRSIG NSEC"),
+				rrsig("a.dnssex.nl.	14400	IN	RRSIG	NSEC 8 3 14400 20160428190224 20160329190224 14460 dnssex.nl. S+UMs2ySgRaaRY"),
+			}, dnssexAuth...),
+			Extra: []dns.RR{opt(4096, true)},
+		},
+		// nodata responses
+		{
+			Qname: "wild.dnssex.nl.", Qtype: dns.TypeSRV,
+			Ns: []dns.RR{
+				soa(`dnssex.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1459281744 14400 3600 604800 14400`),
 			},
-			{
-				Qname: "wild.dnssex.nl.", Qtype: dns.TypeSRV, Do: true,
-				Ns: []dns.RR{
-					// TODO(miek): needs closest encloser proof as well? This is the wrong answer
-					nsec(`*.dnssex.nl.	14400	IN	NSEC	a.dnssex.nl. TXT RRSIG NSEC`),
-					rrsig(`*.dnssex.nl.	14400	IN	RRSIG	NSEC 8 2 14400 20160428190224 20160329190224 14460 dnssex.nl. os6INm6q2eXknD5z8TaaDOV+Ge/Ko+2dXnKP+J1fqJzafXJVH1F0nDrcXmMlR6jlBHA=`),
-					rrsig(`dnssex.nl.	1800	IN	RRSIG	SOA 8 2 1800 20160428190224 20160329190224 14460 dnssex.nl. CA/Y3m9hCOiKC/8ieSOv8SeP964Bq++lyH8BZJcTaabAsERs4xj5PRtcxicwQXZiF8fYUCpROlUS0YR8Cdw=`),
-					soa(`dnssex.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1459281744 14400 3600 604800 14400`),
-				},
-				Extra: []dns.RR{opt(4096, true)},
+		},
+		{
+			Qname: "wild.dnssex.nl.", Qtype: dns.TypeSRV, Do: true,
+			Ns: []dns.RR{
+				// TODO(miek): needs closest encloser proof as well? This is the wrong answer
+				nsec(`*.dnssex.nl.	14400	IN	NSEC	a.dnssex.nl. TXT RRSIG NSEC`),
+				rrsig(`*.dnssex.nl.	14400	IN	RRSIG	NSEC 8 2 14400 20160428190224 20160329190224 14460 dnssex.nl. os6INm6q2eXknD5z8TaaDOV+Ge/Ko+2dXnKP+J1fqJzafXJVH1F0nDrcXmMlR6jlBHA=`),
+				rrsig(`dnssex.nl.	1800	IN	RRSIG	SOA 8 2 1800 20160428190224 20160329190224 14460 dnssex.nl. CA/Y3m9hCOiKC/8ieSOv8SeP964Bq++lyH8BZJcTaabAsERs4xj5PRtcxicwQXZiF8fYUCpROlUS0YR8Cdw=`),
+				soa(`dnssex.nl.	1800	IN	SOA	linode.atoom.net. miek.miek.nl. 1459281744 14400 3600 604800 14400`),
 			},
-		*/
+			Extra: []dns.RR{opt(4096, true)},
+		},
 	}
 
 	router := New()

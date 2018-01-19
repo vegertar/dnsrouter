@@ -10,8 +10,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-const wildcardDomainPlaceholder = "*1"
-
 type paramContextKeyType string
 
 const paramContextKey paramContextKeyType = "params"
@@ -43,7 +41,7 @@ func (ps Params) ByName(name string) string {
 // Presently only IN class records are supported.
 type Router struct {
 	trees         map[uint16]*node
-	wildcardTrees map[uint16]*node
+	wildcardTrees map[uint16]*wildcardTree
 	nsecNames     map[uint16]canonicalOrder
 	nsec3Names    map[uint16]canonicalOrder
 
@@ -67,7 +65,7 @@ var _ Handler = new(Router)
 func New() *Router {
 	return &Router{
 		trees:         make(map[uint16]*node),
-		wildcardTrees: make(map[uint16]*node),
+		wildcardTrees: make(map[uint16]*wildcardTree),
 		nsec3Names:    make(map[uint16]canonicalOrder),
 		nsecNames:     make(map[uint16]canonicalOrder),
 	}
@@ -137,19 +135,22 @@ func (r *Router) handle(name string, qclass, qtype, typeCovered uint16, handler 
 		panic(name + ": missing Handler")
 	}
 
-	trees := r.trees
+	var root tree
 
-	// especially, convert wild card domain to placeholder "*1" with rest of labels,
-	// and insert result into the wildcardTrees
 	if strings.HasPrefix(name, "*.") {
-		trees = r.wildcardTrees
-		name = wildcardDomainPlaceholder + name[1:]
-	}
-
-	root := trees[qclass]
-	if root == nil {
-		root = new(node)
-		trees[qclass] = root
+		n := r.wildcardTrees[qclass]
+		if n == nil {
+			n = new(wildcardTree)
+			r.wildcardTrees[qclass] = n
+		}
+		root = n
+	} else {
+		n := r.trees[qclass]
+		if n == nil {
+			n = new(node)
+			r.trees[qclass] = n
+		}
+		root = n
 	}
 
 	indexableName := newIndexableName(name)
@@ -168,20 +169,16 @@ func (r *Router) handle(name string, qclass, qtype, typeCovered uint16, handler 
 	}
 }
 
-// nsecPrevious returns the previous routing item by canonical order,
-// and found indicating whether the original name is existed.
-func (r *Router) nsecPrevious(name string, qclass, qtype uint16) (indexableName string, found bool) {
+// nsecPrevious returns the previous routing item by canonical order.
+func (r *Router) nsecPrevious(name string, qclass, qtype uint16) string {
+	var previous string
 	switch qtype {
 	case dns.TypeNSEC3:
-		if r.nsec3Names != nil {
-			return r.nsec3Names[qclass].Previous(newIndexableName(name))
-		}
+		previous, _ = r.nsec3Names[qclass].Previous(newIndexableName(name))
 	case dns.TypeNSEC:
-		if r.nsecNames != nil {
-			return r.nsecNames[qclass].Previous(newIndexableName(name))
-		}
+		previous, _ = r.nsecNames[qclass].Previous(newIndexableName(name))
 	}
-	return
+	return previous
 }
 
 // Lookup allows the manual lookup of a record.
@@ -223,41 +220,25 @@ FALLBACK:
 	return nil, nil, false
 }
 
-// LookupNSEC performs like Lookup whereas with parameter qtype
-// which is either dns.TypeNSEC or dns.TypeNSEC3.
-func (r *Router) LookupNSEC(name string, qclass, qtype uint16) (NodeHandler, Params, bool) {
-	// TODO: supports NSEC3
-	name = newIndexableName(name)
-	if previousName, found := r.nsecPrevious(name, qclass, qtype); previousName != "" {
-		if !found {
-			name = previousName
-		}
-		return r.Lookup(name, qclass)
+// LookupNSEC looks up the previous NSEC name in canonical order.
+func (r *Router) LookupNSEC(name string, qclass uint16) (NodeHandler, Params, bool) {
+	if previousName := r.nsecPrevious(name, qclass, dns.TypeNSEC); previousName != "" {
+		return r.Lookup(previousName, qclass)
 	}
 	return nil, nil, false
 }
 
 // LookupHandler performs an automated lookup of a DNS request.
 func (r *Router) LookupHandler(msg *dns.Msg) Handler {
-	q := msg.Question[0]
-	qclass := q.Qclass
-	qtype := q.Qtype
-	opt := msg.IsEdns0()
-	do := opt != nil && opt.Do()
-	isNsec := qtype == dns.TypeNSEC || qtype == dns.TypeNSEC3
-	indexableName := newIndexableName(q.Name)
-
 	var (
-		nodeHandlers NodeHandler
-		params       Params
-		cut          bool
-	)
-
-	if isNsec && do {
-		nodeHandlers, params, cut = r.LookupNSEC(indexableName, qclass, qtype)
-	} else {
+		q                         = msg.Question[0]
+		qclass                    = q.Qclass
+		qtype                     = q.Qtype
+		opt                       = msg.IsEdns0()
+		do                        = opt != nil && opt.Do()
+		indexableName             = newIndexableName(q.Name)
 		nodeHandlers, params, cut = r.Lookup(indexableName, qclass)
-	}
+	)
 
 	if nodeHandlers == nil {
 		var h Handler
@@ -275,6 +256,10 @@ func (r *Router) LookupHandler(msg *dns.Msg) Handler {
 			} else {
 				h = NameErrorHandler
 			}
+		}
+
+		if do {
+			h = r.NsecHandler(h)
 		}
 
 		return h
@@ -295,7 +280,7 @@ func (r *Router) LookupHandler(msg *dns.Msg) Handler {
 	}
 
 	// firstly checks CNAME for non-NSEC requests
-	if !isNsec {
+	if qtype != dns.TypeNSEC && qtype != dns.TypeNSEC3 {
 		if cname := nodeHandlers.Search(dns.TypeCNAME); cname != nil {
 			h := ParamsHandler(cname, params)
 			cnameSig := qtypeSig
@@ -319,6 +304,8 @@ func (r *Router) LookupHandler(msg *dns.Msg) Handler {
 		ds, dsSig NodeHandler
 		v         NodeHandler
 		h         Handler
+
+		m = make([]Handler, 0, 4)
 	)
 
 	if qtype == dns.TypeNS {
@@ -341,12 +328,21 @@ FALLBACK:
 		} else {
 			h = NoErrorHandler
 		}
+
+		if do {
+			h = r.NsecHandler(h)
+		}
 	} else {
 		h = ParamsHandler(v, params)
+
+		// specially, there is a wildcard match
+		if do && len(params) > 0 && params[0].Key == wildcardKey {
+			h = r.NsecHandler(h)
+		}
 	}
 
-	m := make([]Handler, 0, 4)
 	m = append(m, h)
+
 	if qtypeSig != nil {
 		m = append(m, ParamsHandler(qtypeSig, params))
 	}
@@ -358,6 +354,77 @@ FALLBACK:
 	}
 
 	return MultipleHandler(m...)
+}
+
+// NsecHandler returns a middleware that filling out denial-of-existence records.
+func (r *Router) NsecHandler(h Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		h.ServeDNS(w, req)
+
+		if req.Rcode == SkipNsecHandler {
+			return
+		}
+
+		q := req.Question[0]
+		result := w.Msg()
+
+		nsecType := dns.TypeNSEC
+		nodeHandler, params, _ := r.Lookup(q.Name, q.Qclass)
+
+		if nodeHandler == nil {
+			nodeHandler, params, _ = r.LookupNSEC(q.Name, q.Qclass)
+		} else {
+			i := first(result.Answer, q.Qtype)
+			if i != -1 && isExpandable(result.Answer[0].Header().Name) {
+				nodeHandler, params, _ = r.LookupNSEC(q.Name, q.Qclass)
+			}
+		}
+
+		if nsecHandler := nodeHandler.Search(nsecType); nsecHandler != nil {
+			nsec := FurtherRequest(w, req, q.Name, q.Qtype, ParamsHandler(nsecHandler, params))
+			result.Ns = append(result.Ns, nsec.Answer...)
+			if sigHandler := nodeHandler.Search(dns.TypeRRSIG).SearchCovered(nsecType); sigHandler != nil {
+				sig := FurtherRequest(w, req, q.Name, q.Qtype, ParamsHandler(sigHandler, params))
+				result.Ns = append(result.Ns, sig.Answer...)
+			}
+
+			if result.Rcode != dns.RcodeNameError {
+				return
+			}
+
+			i := firstAny(nsec.Answer, dns.TypeNSEC3, dns.TypeNSEC)
+			if i == -1 {
+				return
+			}
+
+			var (
+				nsecType = nsec.Answer[i].Header().Rrtype
+				nsecName = nsec.Answer[i].Header().Name
+
+				offset int
+				end    bool
+			)
+
+			for !end && !strings.HasSuffix(q.Name, nsecName[offset:]) {
+				offset, end = dns.NextLabel(nsecName, offset)
+			}
+
+			for !end && offset > 0 {
+				nodeHandler, params, _ := r.Lookup(nsecName[offset:], q.Qclass)
+				if nsecHandler := nodeHandler.Search(nsecType); nsecHandler != nil {
+					nsec := FurtherRequest(w, req, q.Name, q.Qtype, ParamsHandler(nsecHandler, params))
+					result.Ns = append(result.Ns, nsec.Answer...)
+					if sigHandler := nodeHandler.Search(dns.TypeRRSIG).SearchCovered(nsecType); sigHandler != nil {
+						sig := FurtherRequest(w, req, q.Name, q.Qtype, ParamsHandler(sigHandler, params))
+						result.Ns = append(result.Ns, sig.Answer...)
+					}
+					break
+				}
+
+				offset, end = dns.NextLabel(nsecName, offset)
+			}
+		}
+	})
 }
 
 // ServeDNS makes the router implement the Handler interface.
@@ -468,7 +535,7 @@ func canonicalOrderLess(x, y string) bool {
 			if len(xI) > 1 && xI[0] == '*' {
 				return false
 			}
-			if len(xI) > 1 && yI[0] == '*' {
+			if len(yI) > 1 && yI[0] == '*' {
 				return true
 			}
 			if len(xI) > 1 && xI[0] == ':' && len(yI) > 1 && yI[0] == ':' {
@@ -481,6 +548,23 @@ func canonicalOrderLess(x, y string) bool {
 				return true
 			}
 			return xI < yI
+		}
+	}
+	if x != y {
+		if len(x) > 1 && x[0] == '*' {
+			return false
+		}
+		if len(y) > 1 && y[0] == '*' {
+			return true
+		}
+		if len(x) > 1 && x[0] == ':' && len(y) > 1 && y[0] == ':' {
+			return nX < nY
+		}
+		if len(x) > 1 && x[0] == ':' {
+			return false
+		}
+		if len(y) > 1 && y[0] == ':' {
+			return true
 		}
 	}
 	return x < y

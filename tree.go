@@ -11,6 +11,11 @@ import (
 	"unicode/utf8"
 )
 
+type tree interface {
+	addRoute(name string, allowDup bool, handler nodeHandlerElement)
+	getValue(name string) (handler NodeHandler, p Params, cut bool)
+}
+
 func min(a, b int) int {
 	if a <= b {
 		return a

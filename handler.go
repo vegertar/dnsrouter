@@ -10,6 +10,9 @@ import (
 	"github.com/miekg/dns"
 )
 
+// SkipNsecHandler is a tricky code setting in Rcode field of Request for skipping NsecHandler.
+const SkipNsecHandler = -42
+
 // Middleware is a piece of middleware.
 type Middleware func(Handler) Handler
 
@@ -151,6 +154,13 @@ func CnameHandler(h Handler) Handler {
 			return
 		}
 
+		// skip NsecHandler
+		reqRcode := req.Rcode
+		req.Rcode = SkipNsecHandler
+		defer func() {
+			req.Rcode = reqRcode
+		}()
+
 		answer := result.Answer
 
 		for {
@@ -179,6 +189,13 @@ func ExtraHandler(h Handler) Handler {
 		h.ServeDNS(w, req)
 
 		if result := w.Msg(); len(result.Extra) == 0 && len(result.Answer) > 0 {
+			// skip NsecHandler
+			reqRcode := req.Rcode
+			req.Rcode = SkipNsecHandler
+			defer func() {
+				req.Rcode = reqRcode
+			}()
+
 			for _, rr := range result.Answer {
 				var target string
 				switch rr.Header().Rrtype {
@@ -193,7 +210,7 @@ func ExtraHandler(h Handler) Handler {
 				}
 
 				for _, t := range aReqTypes {
-					extraWriter := FurtherRequest(w, req, target, t, h)
+					extraWriter := FurtherRequest(w, req, target, t, WildcardHandler(h))
 					if extraWriter.Rcode == dns.RcodeNameError {
 						break
 					}
@@ -202,67 +219,6 @@ func ExtraHandler(h Handler) Handler {
 					result.Extra = append(result.Extra, extraWriter.Extra...)
 				}
 			}
-		}
-	})
-}
-
-// NsecHandler is a middleware filling out denial-of-existence records.
-func NsecHandler(h Handler) Handler {
-	return HandlerFunc(func(w ResponseWriter, req *Request) {
-		h.ServeDNS(w, req)
-
-		q := req.Question[0]
-		result := w.Msg()
-
-		if exists(result.Answer, q.Qtype) {
-			return
-		}
-
-		if opt := req.IsEdns0(); opt == nil || !opt.Do() {
-			return
-		}
-
-		var (
-			nsecName string
-			nsecType uint16
-		)
-
-		if nsec3 := FurtherRequest(w, req, q.Name, dns.TypeNSEC3, h); len(nsec3.Answer) > 0 {
-			nsecName = nsec3.Answer[0].Header().Name
-			nsecType = dns.TypeNSEC3
-			result.Ns = append(result.Ns, nsec3.Answer...)
-		} else if nsec := FurtherRequest(w, req, q.Name, dns.TypeNSEC, h); len(nsec.Answer) > 0 {
-			nsecName = nsec.Answer[0].Header().Name
-			nsecType = dns.TypeNSEC
-			result.Ns = append(result.Ns, nsec.Answer...)
-		} else {
-			return
-		}
-
-		if result.Rcode != dns.RcodeNameError {
-			return
-		}
-
-		var nsec dns.Msg
-		closestName := nsecName
-
-		for !strings.HasSuffix(q.Name, closestName) {
-			if i := strings.Index(closestName, "."); i != -1 {
-				closestName = closestName[i+1:]
-			} else {
-				break
-			}
-
-			nsec = FurtherRequest(w, req, closestName, nsecType, h)
-			if len(nsec.Answer) > 0 {
-				closestName = nsec.Answer[0].Header().Name
-			}
-			if closestName == nsecName {
-				break
-			}
-		}
-		if closestName != nsecName && strings.HasSuffix(q.Name, closestName) {
-			result.Ns = append(result.Ns, nsec.Answer...)
 		}
 	})
 }
@@ -326,6 +282,13 @@ func NxHandler(h Handler) Handler {
 			}
 		}()
 
+		// skip NsecHandler
+		reqRcode := req.Rcode
+		req.Rcode = SkipNsecHandler
+		defer func() {
+			req.Rcode = reqRcode
+		}()
+
 		if i := first(answer, qtype); i != -1 {
 			hasData = true
 			if qtype == dns.TypeNS {
@@ -356,6 +319,7 @@ func NxHandler(h Handler) Handler {
 
 			if !end {
 				name := qname[offset:]
+
 				if len(ns.Answer) == 0 {
 					m := FurtherRequest(w, req, name, dns.TypeNS, h)
 					if m.Rcode == dns.RcodeNameError {
@@ -384,7 +348,7 @@ func WildcardHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
 
-		expandWildcard(w.Msg(), req.Question[0].Name)
+		expandWildcard(w.Msg().Answer, req.Question[0].Name, req.Question[0].Qtype)
 	})
 }
 
@@ -511,7 +475,6 @@ var (
 		OptHandler,
 		WildcardHandler,
 		NxHandler,
-		NsecHandler,
 		ExtraHandler,
 		CnameHandler,
 	}
@@ -594,21 +557,60 @@ func apexFromNsec(rrSet []dns.RR) (nsOwner, soaOwner string) {
 	return
 }
 
-func expandWildcard(result *dns.Msg, qname string) {
-	if len(result.Answer) == 0 {
-		return
+func expandWildcard(rrSet []dns.RR, qname string, qtype uint16) (wildcardName string) {
+	var expanded, expandedCname bool
+
+	for i, rr := range rrSet {
+		h := rr.Header()
+		if !isExpandable(h.Name) {
+			continue
+		}
+
+		if h.Rrtype == qtype {
+			expanded = true
+		} else if h.Rrtype == dns.TypeCNAME {
+			expandedCname = true
+		} else if h.Rrtype == dns.TypeRRSIG {
+			rrsig := rr.(*dns.RRSIG)
+			if rrsig.TypeCovered == qtype {
+				expanded = true
+			} else if rrsig.TypeCovered == dns.TypeCNAME {
+				expandedCname = true
+			}
+		}
+
+		if expanded && expandedCname {
+			panic(h.Name + ": confusing expansion with CNAME")
+		}
+
+		if expanded || expandedCname {
+			if wildcardName != "" && rr.Header().Name != wildcardName {
+				panic(fmt.Sprintf(`wildcard name "%s" conflicting with previous one: %s`,
+					rr.Header().Name, wildcardName))
+			}
+			wildcardName = rr.Header().Name
+			rr = dns.Copy(rr)
+			rr.Header().Name = qname
+			rrSet[i] = rr
+		}
 	}
 
-	name := result.Answer[0].Header().Name
-	if !strings.HasPrefix(name, "*") && !strings.Contains(name, ":") {
-		return
-	}
+	return
+}
 
-	for i, rr := range result.Answer {
-		rr = dns.Copy(rr)
-		rr.Header().Name = qname
-		result.Answer[i] = rr
+func isExpandable(name string) bool {
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case ':':
+			return true
+		case '*':
+			// *. or *name
+			if i == 0 || i+1 < len(name) && name[i+1] != '.' {
+				return true
+			}
+		}
 	}
+	return false
 }
 
 // see https://gist.github.com/swdunlop/9629168
