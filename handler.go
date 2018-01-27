@@ -144,22 +144,113 @@ func ParamsHandler(h Handler, params Params) Handler {
 	})
 }
 
+// BasicHandler is a middleware filling out essential answer section.
+func BasicHandler(h Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		h.ServeDNS(w, req)
+
+		result := w.Msg()
+		if result.Rcode != dns.RcodeSuccess {
+			return
+		}
+
+		qtype := req.Question[0].Qtype
+		if existsAny(result.Answer, dns.TypeCNAME, qtype) ||
+			qtype == dns.TypeANY && len(result.Answer) > 0 {
+			return
+		}
+
+		var class Class
+		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
+			class = classValue.(Class)
+		} else {
+			return
+		}
+
+		var (
+			rrsig             Class
+			h, sig, ds, dsSig Handler
+		)
+
+		if opt := req.IsEdns0(); opt != nil && opt.Do() {
+			if qtype != dns.TypeRRSIG && qtype != dns.TypeANY {
+				if v, ok := class.Search(dns.TypeRRSIG).(Class); ok {
+					rrsig = v
+				}
+			}
+		}
+
+		if qtype == dns.TypeANY {
+			h = class.Search(dns.TypeANY)
+		} else {
+			if qtype == dns.TypeNS {
+				// might be a delegation
+				//ds = class.Search(dns.TypeDS)
+				//if rrsig != nil {
+				//dsSig = rrsig.Search(dns.TypeDS)
+				//}
+			}
+
+			h = class.Search(qtype)
+			if rcode, ok := h.(RcodeHandler); ok && rcode == NoErrorHandler {
+				h = class.Search(0)
+			}
+
+			if rrsig != nil {
+				if t, ok := h.(CheckRedirect); ok {
+					qtype = t.Qtype()
+				}
+				sig = rrsig.Search(qtype)
+			}
+		}
+
+		if sig != nil || ds != nil || dsSig != nil {
+			h = MultipleHandler(h, sig, ds, dsSig)
+		}
+
+		h.ServeDNS(w, req)
+	})
+}
+
 // CnameHandler is a middleware following the query on canonical name.
 func CnameHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
 
-		qtype, result := req.Question[0].Qtype, w.Msg()
-		if qtype == dns.TypeCNAME {
+		var (
+			qname  = req.Question[0].Name
+			qtype  = req.Question[0].Qtype
+			result = w.Msg()
+		)
+
+		if i := first(result.Answer, dns.TypeDNAME); i != -1 {
+			dname := result.Answer[i].(*dns.DNAME)
+			owner := dname.Hdr.Name
+			diff := len(qname) - len(owner)
+			if diff > 0 && dns.IsSubDomain(owner, qname) {
+				cname := new(dns.CNAME)
+				cname.Hdr = dns.RR_Header{
+					Name:   req.Question[0].Name,
+					Rrtype: dns.TypeCNAME,
+					Class:  dns.ClassINET,
+					Ttl:    dname.Hdr.Ttl,
+				}
+				cname.Target = qname[:diff] + dname.Target
+				result.Answer = append(result.Answer, cname)
+			}
+		}
+
+		if qtype == dns.TypeCNAME || qtype == dns.TypeANY {
 			return
 		}
 
-		// skip NsecHandler
-		reqRcode := req.Rcode
-		req.Rcode = SkipNsecHandler
-		defer func() {
-			req.Rcode = reqRcode
-		}()
+		var stub Stub
+		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
+			stub = classValue.(Class).Invert()
+		}
+		if stub == nil {
+			return
+		}
 
 		answer := result.Answer
 
@@ -175,8 +266,13 @@ func CnameHandler(h Handler) Handler {
 				break
 			}
 
-			cnameWriter := FurtherRequest(w, req, cname, qtype, WildcardHandler(h))
-			result.Rcode = cnameWriter.Rcode
+			class := stub.Lookup(cname, req.Question[0].Qclass)
+			if _, ok := class.Search(dns.TypeANY).(RcodeHandler); ok {
+				break
+			}
+
+			ctx := context.WithValue(req.Context(), ClassContextKey, class)
+			cnameWriter := FurtherRequest(w, req.WithContext(ctx), cname, qtype, WildcardHandler(h))
 			result.Answer = append(result.Answer, cnameWriter.Answer...)
 			answer = cnameWriter.Answer
 		}
@@ -188,13 +284,18 @@ func ExtraHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
 
+		if req.Question[0].Qtype == dns.TypeANY {
+			return
+		}
+
 		if result := w.Msg(); len(result.Extra) == 0 && len(result.Answer) > 0 {
-			// skip NsecHandler
-			reqRcode := req.Rcode
-			req.Rcode = SkipNsecHandler
-			defer func() {
-				req.Rcode = reqRcode
-			}()
+			var stub Stub
+			if classValue := req.Context().Value(ClassContextKey); classValue != nil {
+				stub = classValue.(Class).Invert()
+			}
+			if stub == nil {
+				return
+			}
 
 			for _, rr := range result.Answer {
 				var target string
@@ -209,8 +310,16 @@ func ExtraHandler(h Handler) Handler {
 					continue
 				}
 
+				class := stub.Lookup(target, req.Question[0].Qclass)
+				if _, ok := class.Search(dns.TypeANY).(RcodeHandler); ok {
+					continue
+				}
+
+				ctx := context.WithValue(req.Context(), ClassContextKey, class)
+				extraReq := req.WithContext(ctx)
+
 				for _, t := range aReqTypes {
-					extraWriter := FurtherRequest(w, req, target, t, WildcardHandler(h))
+					extraWriter := FurtherRequest(w, extraReq, target, t, WildcardHandler(h))
 					if extraWriter.Rcode == dns.RcodeNameError {
 						break
 					}
@@ -223,122 +332,145 @@ func ExtraHandler(h Handler) Handler {
 	})
 }
 
-// NxHandler is a middleware filling out a SOA record if occurs NXDOMAIN or NOERROR with no data,
-// as well as filling out NS records for non-NS queries. The authoritative field will be set
-// appropriately depending whether the requested owner name is delegated or not.
-func NxHandler(h Handler) Handler {
+// NsHandler returns a middleware that filling out NS section.
+func NsHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
 
 		var (
 			qtype  = req.Question[0].Qtype
-			qname  = req.Question[0].Name
 			result = w.Msg()
-			offset = 0
-			rcode  = result.Rcode
-			answer = result.Answer
 		)
 
-		if rcode != dns.RcodeNameError && rcode != dns.RcodeSuccess ||
+		if qtype == dns.TypeANY ||
+			result.Rcode != dns.RcodeNameError && result.Rcode != dns.RcodeSuccess ||
 			existsAny(result.Ns, dns.TypeNS, dns.TypeSOA) {
 			return
 		}
 
-		if i := firstNotAny(answer,
-			dns.TypeCNAME,
-			dns.TypeRRSIG,
-			dns.TypeNSEC,
-			dns.TypeNSEC3,
-		); i != -1 {
-			qname, answer = answer[i].Header().Name, answer[i:]
-		}
+		hasData := existsAny(result.Answer, qtype, dns.TypeCNAME)
 
-		var (
-			ns, soa dns.Msg
-			hasData bool
-		)
-
-		defer func() {
-			result.Authoritative = true
-			if len(soa.Answer) == 0 {
-				// delegated
-				result.Authoritative = false
-				if qtype != dns.TypeDS {
-					result.Answer = nil
-				}
-				result.Ns = ns.Answer
-				result.Extra = ns.Extra
-				if result.Rcode == dns.RcodeNameError {
-					result.Rcode = dns.RcodeSuccess
-				}
-			} else if hasData {
-				if qtype != dns.TypeNS {
-					result.Ns = append(result.Ns, ns.Answer...)
-					result.Extra = append(result.Extra, ns.Extra...)
-				}
-			} else {
-				result.Ns = append(result.Ns, soa.Answer...)
-				result.Extra = append(result.Extra, soa.Extra...)
-			}
-		}()
-
-		// skip NsecHandler
-		reqRcode := req.Rcode
-		req.Rcode = SkipNsecHandler
-		defer func() {
-			req.Rcode = reqRcode
-		}()
-
-		if i := first(answer, qtype); i != -1 {
-			hasData = true
-			if qtype == dns.TypeNS {
-				ns.Answer, ns.Extra = result.Answer, result.Extra
-				if m := FurtherRequest(w, req, qname, dns.TypeSOA, h); exists(m.Answer, dns.TypeSOA) {
-					soa = m
-				}
-				return
-			}
-		}
-
-		if nsOwner, soaOwner := apexFromNsec(result.Ns); nsOwner != "" || soaOwner != "" {
-			if nsOwner != soaOwner && len(nsOwner) > len(soaOwner) {
-				ns = FurtherRequest(w, req, nsOwner, dns.TypeNS, h)
-			} else if !hasData {
-				soa = FurtherRequest(w, req, soaOwner, dns.TypeSOA, h)
-			}
-
+		var class Class
+		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
+			class = classValue.(Class)
+		} else {
 			return
 		}
 
-		for i, end := 0, false; !end && len(ns.Answer) == 0; i++ {
-			if rcode == dns.RcodeNameError || // directly go up when NXDOMAIN
-				hasData && qtype == dns.TypeDS || // always go up when delegated
-				i > 0 { // go up from 2nd iteration when NOERROR but no data
-				offset, end = dns.NextLabel(qname, offset)
-			}
-
-			if !end {
-				name := qname[offset:]
-
-				if len(ns.Answer) == 0 {
-					m := FurtherRequest(w, req, name, dns.TypeNS, h)
-					if m.Rcode == dns.RcodeNameError {
-						continue
-					}
-					if exists(m.Answer, dns.TypeNS) {
-						ns = m
-					}
+		if zone, delegated := class.Zone(); zone != nil {
+			if delegated {
+				result.Authoritative = false
+				if hasData && qtype == dns.TypeNS {
+					result.Answer, result.Ns = result.Ns, result.Answer
+					return
 				}
-				if len(soa.Answer) == 0 {
-					m := FurtherRequest(w, req, name, dns.TypeSOA, h)
-					if m.Rcode == dns.RcodeNameError {
-						continue
-					}
-					if exists(m.Answer, dns.TypeSOA) {
-						soa = m
-					}
+
+				// clears data for delegation
+				result.Answer = nil
+			} else {
+				result.Authoritative = true
+
+				if hasData && qtype == dns.TypeNS {
+					return
 				}
 			}
+
+			var nsType uint16
+
+			if hasData || delegated {
+				nsType = dns.TypeNS
+				result.Rcode = dns.RcodeSuccess
+			} else {
+				nsType = dns.TypeSOA
+			}
+
+			ctx := context.WithValue(req.Context(), ClassContextKey, zone)
+			m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, nsType, h)
+			result.Ns = append(result.Ns, m.Answer...)
+			result.Extra = append(result.Extra, m.Extra...)
+		}
+	})
+}
+
+// NsecHandler returns a middleware that filling out denial-of-existence records.
+func NsecHandler(h Handler) Handler {
+	return HandlerFunc(func(w ResponseWriter, req *Request) {
+		h.ServeDNS(w, req)
+
+		if req.Question[0].Qtype == dns.TypeANY {
+			return
+		}
+
+		if opt := req.IsEdns0(); opt == nil || !opt.Do() {
+			return
+		}
+
+		result := w.Msg()
+		if existsAny(result.Ns, dns.TypeNSEC, dns.TypeNSEC3) {
+			return
+		}
+
+		var class, nextSecure Class
+
+		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
+			class = classValue.(Class)
+		} else {
+			return
+		}
+
+		var nsecType = dns.TypeNSEC
+
+		if i := firstAny(result.Answer, dns.TypeCNAME, req.Question[0].Qtype); i != -1 {
+			if isExpandable(result.Answer[i].Header().Name) {
+				nextSecure = class.NextSecure(nsecType)
+			}
+		} else if result.Rcode == dns.RcodeNameError {
+			nextSecure = class.NextSecure(nsecType)
+		} else if result.Rcode == dns.RcodeSuccess {
+			if _, ok := class.Search(dns.TypeANY).(RcodeHandler); ok {
+				nextSecure = class.NextSecure(nsecType)
+			} else {
+				nextSecure = class
+			}
+		}
+
+		if nextSecure == nil {
+			return
+		}
+
+		var nsec, nsecSig Handler
+
+		nsec = nextSecure.Search(nsecType)
+		if nsecRrsig, ok := nextSecure.Search(dns.TypeRRSIG).(Class); ok {
+			nsecSig = nsecRrsig.Search(nsecType)
+		}
+
+		m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultipleHandler(nsec, nsecSig))
+		result.Ns = append(result.Ns, m.Answer...)
+
+		if result.Rcode != dns.RcodeNameError {
+			return
+		}
+
+		i := first(m.Answer, nsecType)
+		if i == -1 {
+			return
+		}
+
+		if dns.IsSubDomain(m.Answer[i].Header().Name, req.Question[0].Name) {
+			return
+		}
+
+		if zone, _ := class.Zone(); zone != nil {
+			var zoneNsec, zoneNsecSig Handler
+
+			zoneNsec = zone.Search(nsecType)
+			if zoneRrsig, ok := zone.Search(dns.TypeRRSIG).(Class); ok {
+				zoneNsecSig = zoneRrsig.Search(nsecType)
+			}
+
+			m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultipleHandler(zoneNsec, zoneNsecSig))
+			result.Ns = append(result.Ns, m.Answer...)
 		}
 	})
 }
@@ -347,6 +479,10 @@ func NxHandler(h Handler) Handler {
 func WildcardHandler(h Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		h.ServeDNS(w, req)
+
+		if req.Question[0].Qtype == dns.TypeANY {
+			return
+		}
 
 		expandWildcard(w.Msg().Answer, req.Question[0].Name, req.Question[0].Qtype)
 	})
@@ -384,7 +520,7 @@ func RefusedHandler(h Handler) Handler {
 		h.ServeDNS(w, req)
 
 		result := w.Msg()
-		if len(result.Answer) == 0 && len(result.Ns) == 0 && result.Rcode == dns.RcodeSuccess {
+		if len(result.Answer) == 0 && len(result.Ns) == 0 && result.Rcode == dns.RcodeNameError {
 			result.Rcode = dns.RcodeRefused
 		}
 	})
@@ -423,14 +559,6 @@ func MultipleHandler(m ...Handler) Handler {
 	})
 }
 
-// ChainHandler applies middlewares on given handler.
-func ChainHandler(h Handler, middlewares ...Middleware) Handler {
-	for i, n := 0, len(middlewares); i < n; i++ {
-		h = middlewares[n-i-1](h)
-	}
-	return h
-}
-
 // FurtherRequest is a helper function to execute another query within current context.
 func FurtherRequest(w ResponseWriter, req *Request, qname string, qtype uint16, h Handler) dns.Msg {
 	rawW := *w.Msg()
@@ -449,14 +577,8 @@ func FurtherRequest(w ResponseWriter, req *Request, qname string, qtype uint16, 
 	return *w.Msg()
 }
 
-// Classic returns a github.com/miekg/dns.Handler.
-// If middlewares is nil, then use DefaultScheme.
-func Classic(ctx context.Context, h Handler, middlewares ...Middleware) dns.Handler {
-	if middlewares == nil {
-		middlewares = DefaultScheme
-	}
-	h = ChainHandler(h, middlewares...)
-
+// Classic converts a Handler into the github.com/miekg/dns.Handler.
+func Classic(ctx context.Context, h Handler) dns.Handler {
 	return dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 		resp := NewResponseWriter()
 		req := &Request{Msg: r, ctx: ctx}
@@ -467,16 +589,37 @@ func Classic(ctx context.Context, h Handler, middlewares ...Middleware) dns.Hand
 	})
 }
 
+// chainHandler applies middlewares on given handler.
+func chainHandler(h Handler, middlewares ...Middleware) Handler {
+	for i, n := 0, len(middlewares); i < n; i++ {
+		h = middlewares[n-i-1](h)
+	}
+	return h
+}
+
 var (
-	// DefaultScheme consists of essential middlewares.
+	// DefaultScheme consists of middlewares serving as a complete stub name server.
 	DefaultScheme = []Middleware{
 		PanicHandler,
 		RefusedHandler,
 		OptHandler,
 		WildcardHandler,
-		NxHandler,
+		NsecHandler,
+		NsHandler,
 		ExtraHandler,
 		CnameHandler,
+		BasicHandler,
+	}
+
+	// SimpleScheme consists of essential middlewares without filling out NS and ADDITIONAL sections.
+	// This scheme is faster (2x bench of DefaultScheme) and suitable for most of ordinary situations.
+	SimpleScheme = []Middleware{
+		PanicHandler,
+		RefusedHandler,
+		OptHandler,
+		WildcardHandler,
+		CnameHandler,
+		BasicHandler,
 	}
 )
 
@@ -524,37 +667,6 @@ func firstNotAny(rrSet []dns.RR, t ...uint16) int {
 		}
 	}
 	return -1
-}
-
-func apexFromNsec(rrSet []dns.RR) (nsOwner, soaOwner string) {
-	for _, rr := range rrSet {
-		switch rr.Header().Rrtype {
-		case dns.TypeNSEC:
-			nsec := rr.(*dns.NSEC)
-			for _, b := range nsec.TypeBitMap {
-				switch b {
-				case dns.TypeNS:
-					if nsOwner == "" {
-						nsOwner = nsec.Header().Name
-					}
-				case dns.TypeSOA:
-					if soaOwner == "" {
-						soaOwner = nsec.Header().Name
-					}
-				case dns.TypeDS:
-					nsOwner = ""
-					soaOwner = ""
-				}
-			}
-		case dns.TypeNSEC3:
-			// TODO: supports NSEC3
-		}
-
-		if nsOwner != "" && soaOwner != "" {
-			return
-		}
-	}
-	return
 }
 
 func expandWildcard(rrSet []dns.RR, qname string, qtype uint16) (wildcardName string) {

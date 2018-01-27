@@ -9,11 +9,34 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/miekg/dns"
 )
 
-type tree interface {
-	addRoute(name string, allowDup bool, handler nodeHandlerElement)
-	getValue(name string) (handler NodeHandler, p Params, cut bool)
+type paramContextKeyType int
+
+const paramContextKey paramContextKeyType = 0
+
+// Param is a single domain parameter, consisting of a key and a value.
+type Param struct {
+	Key   string
+	Value string
+}
+
+// Params is a Param-slice, as returned by the router.
+// The slice is ordered, the first domain parameter is also the first slice value.
+// It is therefore safe to read values by the index.
+type Params []Param
+
+// ByName returns the value of the first Param which key matches the given name.
+// If no matching Param is found, an empty string is returned.
+func (ps Params) ByName(name string) string {
+	for i := range ps {
+		if ps[i].Key == name {
+			return ps[i].Value
+		}
+	}
+	return ""
 }
 
 func min(a, b int) int {
@@ -26,7 +49,7 @@ func min(a, b int) int {
 func countParams(name string) uint8 {
 	var n uint
 	for i := 0; i < len(name); i++ {
-		if name[i] != ':' && name[i] != '*' {
+		if c := name[i]; c != ':' && c != '*' || c == '*' && i+1 == len(name) {
 			continue
 		}
 		n++
@@ -46,30 +69,37 @@ const (
 	catchAll
 )
 
-type nodeHandlerElement struct {
+type wildChildType uint8
+
+const (
+	noWildChild wildChildType = iota // default
+	namedWildChild
+	anonymousWildChild
+)
+
+type typeHandler struct {
 	Qtype       uint16
 	TypeCovered uint16
 	Handler     Handler
 }
 
-// NodeHandler is the data associating with a node in tree.
-type NodeHandler []nodeHandlerElement
+type classHandler []typeHandler
 
-func (l NodeHandler) Len() int {
+func (l classHandler) Len() int {
 	return len(l)
 }
 
-func (l NodeHandler) Less(a, b int) bool {
+func (l classHandler) Less(a, b int) bool {
 	return l[a].Qtype < l[b].Qtype ||
 		l[a].Qtype == l[b].Qtype && l[a].TypeCovered < l[b].TypeCovered
 }
 
-func (l NodeHandler) Swap(a, b int) {
+func (l classHandler) Swap(a, b int) {
 	l[a], l[b] = l[b], l[a]
 }
 
 // Search returns a slice matching with qtype.
-func (l NodeHandler) Search(qtype uint16) NodeHandler {
+func (l classHandler) Search(qtype uint16) classHandler {
 	i := sort.Search(len(l), func(i int) bool {
 		return l[i].Qtype >= qtype
 	})
@@ -89,7 +119,7 @@ func (l NodeHandler) Search(qtype uint16) NodeHandler {
 
 // SearchCovered returns a slice matching with typeCovered.
 // This method should be called on a slice returned from method .Search(qtype).
-func (l NodeHandler) SearchCovered(typeCovered uint16) NodeHandler {
+func (l classHandler) SearchCovered(typeCovered uint16) classHandler {
 	i := sort.Search(len(l), func(i int) bool {
 		return l[i].TypeCovered >= typeCovered
 	})
@@ -108,7 +138,7 @@ func (l NodeHandler) SearchCovered(typeCovered uint16) NodeHandler {
 }
 
 // ServeDNS implements Handler interface.
-func (l NodeHandler) ServeDNS(w ResponseWriter, r *Request) {
+func (l classHandler) ServeDNS(w ResponseWriter, r *Request) {
 	for _, h := range l {
 		if h.Handler != nil {
 			h.Handler.ServeDNS(w, r)
@@ -116,14 +146,79 @@ func (l NodeHandler) ServeDNS(w ResponseWriter, r *Request) {
 	}
 }
 
+type rrType uint8
+
+const (
+	rrNs    rrType = 1 << iota
+	rrSoa          = 1 << iota
+	rrDname        = 1 << iota
+
+	rrZone = rrNs | rrSoa
+)
+
+type nodeData struct {
+	handler classHandler
+	rrType  rrType
+}
+
+func (p *nodeData) addHandler(h typeHandler) {
+	p.handler = append(p.handler, h)
+	if len(p.handler) > 1 {
+		sort.Sort(p.handler)
+	}
+	switch h.Qtype {
+	case dns.TypeNS:
+		p.rrType |= rrNs
+	case dns.TypeSOA:
+		p.rrType |= rrSoa
+	case dns.TypeDNAME:
+		p.rrType |= rrDname
+	}
+}
+
+type value struct {
+	node   *node
+	params Params
+	cut    bool // cut means search stopped by a dot
+	zone   struct {
+		node   *node
+		params Params
+	}
+}
+
+// TODO: this is a NSEC-specific lookup.
+func (v value) getPrevNode() *node {
+	if v.zone.node == nil {
+		return nil
+	}
+
+	return nil
+}
+
+// this is used to revert params according to indexable domain
+func (v *value) revertParams() {
+	for i, param := range v.params {
+		if dns.CountLabel(param.Value) > 1 {
+			v.params[i].Value = indexable(param.Value)
+		}
+	}
+	for i, j := 0, len(v.params)-1; i < j; i, j = i+1, j-1 {
+		v.params[i], v.params[j] = v.params[j], v.params[i]
+	}
+
+	if len(v.zone.params) < len(v.params) {
+		v.zone.params = v.params[len(v.params)-len(v.zone.params):]
+	}
+}
+
 type node struct {
 	name      string
-	wildChild bool
+	wildChild wildChildType
 	nType     nodeType
 	maxParams uint8
 	indices   string
 	children  []*node
-	handler   NodeHandler
+	data      *nodeData
 	priority  uint32
 }
 
@@ -153,7 +248,8 @@ func (n *node) incrementChildPrio(pos int) int {
 
 // addRoute adds a node with the given handler to the name.
 // Not concurrency-safe!
-func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) {
+func (n *node) addRoute(name string, allowDup bool, handler typeHandler) {
+	var anonymousParent *node
 	fullName := name
 	n.priority++
 	numParams := countParams(name)
@@ -184,7 +280,7 @@ func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) 
 					nType:     static,
 					indices:   n.indices,
 					children:  n.children,
-					handler:   n.handler,
+					data:      n.data,
 					priority:  n.priority - 1,
 				}
 
@@ -199,15 +295,20 @@ func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) 
 				// []byte for proper unicode char conversion, see #65
 				n.indices = string([]byte{n.name[i]})
 				n.name = name[:i]
-				n.handler = nil
-				n.wildChild = false
+				n.data = nil
+				n.wildChild = noWildChild
+				if anonymousParent != nil {
+					anonymousParent.wildChild = noWildChild
+					n.wildChild = anonymousWildChild
+					anonymousParent = nil
+				}
 			}
 
 			// Make new node a child of this node
 			if i < len(name) {
 				name = name[i:]
 
-				if n.wildChild {
+				if n.wildChild == namedWildChild {
 					n = n.children[0]
 					n.priority++
 
@@ -252,15 +353,23 @@ func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) 
 				for i := 0; i < len(n.indices); i++ {
 					if c == n.indices[i] {
 						i = n.incrementChildPrio(i)
+						if n.wildChild == anonymousWildChild {
+							anonymousParent = n
+						} else {
+							anonymousParent = nil
+						}
 						n = n.children[i]
 						continue walk
 					}
 				}
 
 				// Otherwise insert it
-				if c != ':' && c != '*' {
+				if c != ':' && c != '*' || strings.HasSuffix(name, "*") {
 					// []byte for proper unicode char conversion, see #65
 					n.indices += string([]byte{c})
+					if strings.HasSuffix(name, "*") {
+						n.wildChild = anonymousWildChild
+					}
 					child := &node{
 						maxParams: numParams,
 					}
@@ -272,11 +381,13 @@ func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) 
 				return
 
 			} else if i == len(name) { // Make node a (in-name) leaf
-				if len(n.handler) != 0 && !allowDup {
+				if n.data != nil && !allowDup {
 					panic("a handle is already registered for name '" + fullName + "'")
 				}
-				n.handler = append(n.handler, handler)
-				sort.Sort(n.handler)
+				if n.data == nil {
+					n.data = new(nodeData)
+				}
+				n.data.addHandler(handler)
 			}
 			return
 		}
@@ -286,7 +397,7 @@ func (n *node) addRoute(name string, allowDup bool, handler nodeHandlerElement) 
 	}
 }
 
-func (n *node) insertChild(numParams uint8, name, fullName string, handler nodeHandlerElement) {
+func (n *node) insertChild(numParams uint8, name, fullName string, handler typeHandler) {
 	var offset int // already handled bytes of the name
 
 	// find prefix until first wildcard (beginning with ':'' or '*'')
@@ -333,7 +444,7 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler nodeH
 				maxParams: numParams,
 			}
 			n.children = []*node{child}
-			n.wildChild = true
+			n.wildChild = namedWildChild
 			n = child
 			n.priority++
 			numParams--
@@ -371,7 +482,7 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler nodeH
 
 			// first node: catchAll node with empty name
 			child := &node{
-				wildChild: true,
+				wildChild: namedWildChild,
 				nType:     catchAll,
 				maxParams: 1,
 			}
@@ -385,9 +496,10 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler nodeH
 				name:      name[i:],
 				nType:     catchAll,
 				maxParams: 1,
-				handler:   []nodeHandlerElement{handler},
+				data:      new(nodeData),
 				priority:  1,
 			}
+			child.data.addHandler(handler)
 			n.children = []*node{child}
 
 			return
@@ -396,35 +508,74 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler nodeH
 
 	// insert remaining name part and handler to the leaf
 	n.name = name[offset:]
-	n.handler = []nodeHandlerElement{handler}
+	if n.data == nil {
+		n.data = new(nodeData)
+	}
+	n.data.addHandler(handler)
 }
 
 // Returns the handler registered with the given name (key). The values of
 // wildcards are saved to a map. The third returned value cut indicating whether
 // the searching is ending at a cut of a name.
-func (n *node) getValue(name string) (handler NodeHandler, p Params, cut bool) {
-	var end int
+func (n *node) getValue(name string) (v value) {
+	var (
+		end            int
+		fallbackNode   *node
+		fallbackName   string
+		fallbackParams Params
+		fallback       bool
+		p              Params
+	)
 
 	defer func() {
-		if l := len(name); handler == nil {
+		v.params = p
+
+		if v.node != nil && v.node.data.rrType&rrZone > 0 {
+			v.zone.node, v.zone.params = n, p
+		}
+
+		if v.node == nil {
 			switch n.nType {
-			case static:
-				cut = l < len(n.name) && n.name[l] == '.'
+			case static, root:
+				l := len(name)
+				v.cut = l < len(n.name) && n.name[l] == '.' && n.name[:l] == name
 			case param:
 				// both name and n.name have no child.
-				cut = end == len(name)
+				v.cut = end == len(name)
 			}
 		}
 	}()
+
 walk: // outer loop for walking the tree
 	for {
 		if len(name) > len(n.name) && name[:len(n.name)] == n.name {
+			if n.wildChild == anonymousWildChild {
+				fallbackNode, fallbackName, fallbackParams = n, name, p
+			}
+
 			name = name[len(n.name):]
+
+			if n.data != nil && strings.HasPrefix(name, ".") {
+				if n.data.rrType&rrZone > 0 {
+					v.zone.node, v.zone.params = n, p
+				}
+
+				if n.data.rrType&rrDname > 0 {
+					v.node = n
+					v.cut = true
+					return
+				}
+			}
+
 			// If this node does not have a wildcard (param or catchAll)
 			// child,  we can just look up the next child node and continue
 			// to walk down the tree
-			if !n.wildChild {
+			if n.wildChild != 1 {
 				c := name[0]
+				if fallback {
+					c = '*'
+				}
+
 				for i := 0; i < len(n.indices); i++ {
 					if c == n.indices[i] {
 						n = n.children[i]
@@ -433,6 +584,10 @@ walk: // outer loop for walking the tree
 				}
 
 				// Nothing found.
+				if fallbackNode != nil {
+					n, name, p, fallback = fallbackNode, fallbackName, fallbackParams, true
+					continue walk
+				}
 				return
 			}
 
@@ -448,8 +603,8 @@ walk: // outer loop for walking the tree
 
 				// save param value
 				if p == nil {
-					// lazy allocation
-					p = make(Params, 0, n.maxParams)
+					// lazy allocation, the additional 1 space is reserved for anonymous wildcard
+					p = make(Params, 0, n.maxParams+1)
 				}
 				i := len(p)
 				p = p[:i+1] // expand slice within preallocated capacity
@@ -458,6 +613,17 @@ walk: // outer loop for walking the tree
 
 				// we need to go deeper!
 				if end < len(name) {
+					if n.data != nil {
+						if n.data.rrType&rrZone > 0 {
+							v.zone.node, v.zone.params = n, p
+						}
+
+						if n.data.rrType&rrDname > 0 {
+							v.node = n
+							return
+						}
+					}
+
 					if len(n.children) > 0 {
 						name = name[end:]
 						n = n.children[0]
@@ -465,12 +631,17 @@ walk: // outer loop for walking the tree
 					}
 
 					// ... but we can't
+					if fallbackNode != nil {
+						n, name, p, fallback = fallbackNode, fallbackName, fallbackParams, true
+						continue walk
+					}
 					return
 				}
 
-				if len(n.handler) > 0 {
-					handler = n.handler
+				if n.data != nil {
+					v.node = n
 				}
+
 				return
 
 			case catchAll:
@@ -484,17 +655,49 @@ walk: // outer loop for walking the tree
 				p[i].Key = n.name[2:]
 				p[i].Value = name
 
-				if len(n.handler) > 0 {
-					handler = n.handler
+				if n.data != nil {
+					v.node = n
 				}
 				return
 
 			default:
 				panic("invalid node type")
 			}
-		} else if name == n.name && len(n.handler) > 0 {
+		} else if name == n.name && n.data != nil {
 			// We should have reached the node containing the handle.
-			handler = n.handler
+			v.node = n
+		} else {
+			if fallback && n.name == "*" || strings.HasSuffix(n.name, ".*") {
+				if dot := strings.LastIndex(n.name, ".*"); dot != -1 {
+					if len(name) <= dot || name[:dot+1] != n.name[:dot+1] {
+						return
+					}
+					name = name[dot+1:]
+				}
+
+				if n.data != nil {
+					v.node = n
+				}
+
+				// save param value
+				if p == nil {
+					// lazy allocation
+					p = make(Params, 0, n.maxParams+1)
+				}
+				i := len(p)
+				p = p[:i+1] // expand slice within preallocated capacity
+				p[i].Value = name
+				return
+			}
+
+			if fallback {
+				panic("failed fallback for route: " + n.name + " and name: " + name)
+			}
+
+			if fallbackNode != nil {
+				n, name, p, fallback = fallbackNode, fallbackName, fallbackParams, true
+				continue walk
+			}
 		}
 
 		return
@@ -528,7 +731,7 @@ walk: // outer loop for walking the tree
 			// If this node does not have a wildcard (param or catchAll) child,
 			// we can just look up the next child node and continue to walk down
 			// the tree
-			if !n.wildChild {
+			if n.wildChild == noWildChild {
 				// skip rune bytes already processed
 				rb = shiftNRuneBytes(rb, len(loNName))
 
@@ -626,7 +829,7 @@ walk: // outer loop for walking the tree
 					return ciName, false
 				}
 
-				return ciName, n.handler != nil
+				return ciName, n.data != nil
 
 			case catchAll:
 				return append(ciName, name...), true
@@ -635,7 +838,7 @@ walk: // outer loop for walking the tree
 				panic("invalid node type")
 			}
 		} else {
-			return ciName, n.handler != nil
+			return ciName, n.data != nil
 		}
 	}
 

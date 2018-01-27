@@ -10,10 +10,12 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/miekg/dns"
 )
 
 func printChildren(n *node, prefix string) {
-	fmt.Printf(" %02d:%02d %s%s[%d] %v %t %d \r\n", n.priority, n.maxParams, prefix, n.name, len(n.children), n.handler, n.wildChild, n.nType)
+	fmt.Printf(" %02v:%02v %v%v[%v] %v %v %v \r\n", n.priority, n.maxParams, prefix, n.name, len(n.children), n.data, n.wildChild, n.nType)
 	for l := len(n.name); l > 0; l-- {
 		prefix += " "
 	}
@@ -25,8 +27,8 @@ func printChildren(n *node, prefix string) {
 // Used as a workaround since we can't compare functions or their addresses
 var fakeHandlerValue string
 
-func fakeHandler(val string) nodeHandlerElement {
-	return nodeHandlerElement{
+func fakeHandler(val string) typeHandler {
+	return typeHandler{
 		Handler: HandlerFunc(func(ResponseWriter, *Request) {
 			fakeHandlerValue = val
 		}),
@@ -37,33 +39,46 @@ type testRequests []struct {
 	name       string
 	nilHandler bool
 	route      string
+	zone       string
 	ps         Params
 	cut        bool
 }
 
-func checkRequests(t *testing.T, tree tree, requests testRequests) {
+func checkRequests(t *testing.T, tree *node, requests testRequests) {
 	for _, request := range requests {
-		handler, ps, cut := tree.getValue(request.name)
+		v := tree.getValue(request.name)
 
-		if handler == nil {
+		if v.node == nil {
 			if !request.nilHandler {
 				t.Errorf("handle mismatch for route '%s': Expected non-nil handle", request.name)
 			}
 		} else if request.nilHandler {
 			t.Errorf("handle mismatch for route '%s': Expected nil handle", request.name)
 		} else {
-			handler.ServeDNS(nil, nil)
+			v.node.data.handler.ServeDNS(nil, nil)
 			if fakeHandlerValue != request.route {
 				t.Errorf("handle mismatch for route '%s': Wrong handle (%s != %s)", request.name, fakeHandlerValue, request.route)
 			}
 		}
 
-		if !reflect.DeepEqual(ps, request.ps) {
-			t.Errorf("Params mismatch for route '%s'", request.name)
+		if !reflect.DeepEqual(v.params, request.ps) {
+			t.Errorf("Params mismatch for route '%s', expected %v, got %v", request.name, request.ps, v.params)
 		}
-		if cut != request.cut {
-			t.Errorf("cut(%v) mismatch for route '%s'", request.cut, request.name)
+		if v.cut != request.cut {
+			t.Errorf("cut(%v != %v) mismatch for route '%s'", v.cut, request.cut, request.name)
 		}
+
+		if v.zone.node == nil {
+			if request.zone != "" {
+				t.Errorf("zone handle mismatch for route '%s': Expected non-nil zone", request.name)
+			}
+		} else {
+			v.zone.node.data.handler.ServeDNS(nil, nil)
+			if fakeHandlerValue != request.zone {
+				t.Errorf("zone mismatch for route '%s': Wrong zone (%s != %s)", request.name, fakeHandlerValue, request.zone)
+			}
+		}
+
 	}
 }
 
@@ -73,7 +88,7 @@ func checkPriorities(t *testing.T, n *node) uint32 {
 		prio += checkPriorities(t, n.children[i])
 	}
 
-	if n.handler != nil {
+	if n.data != nil {
 		prio++
 	}
 
@@ -95,7 +110,7 @@ func checkMaxParams(t *testing.T, n *node) uint8 {
 			maxParams = params
 		}
 	}
-	if n.nType > root && !n.wildChild {
+	if n.nType > root && n.wildChild == 0 {
 		maxParams++
 	}
 
@@ -141,19 +156,19 @@ func TestTreeAddAndGet(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".a", false, ".a", nil, false},
-		{".", true, "", nil, false},
-		{".hi", false, ".hi", nil, false},
-		{".contact", false, ".contact", nil, false},
-		{".co", false, ".co", nil, false},
-		{".con", true, "", nil, false},  // key mismatch
-		{".cona", true, "", nil, false}, // key mismatch
-		{".no", true, "", nil, false},   // no matching child
-		{".ab", false, ".ab", nil, false},
-		{".α", false, ".α", nil, false},
-		{".β", false, ".β", nil, false},
-		{".doc", true, "", nil, true},
-		{".doc.go1", true, "", nil, true},
+		{".a", false, ".a", "", nil, false},
+		{".", true, "", "", nil, false},
+		{".hi", false, ".hi", "", nil, false},
+		{".contact", false, ".contact", "", nil, false},
+		{".co", false, ".co", "", nil, false},
+		{".con", true, "", "", nil, false},  // key mismatch
+		{".cona", true, "", "", nil, false}, // key mismatch
+		{".no", true, "", "", nil, false},   // no matching child
+		{".ab", false, ".ab", "", nil, false},
+		{".α", false, ".α", "", nil, false},
+		{".β", false, ".β", "", nil, false},
+		{".doc", true, "", "", nil, true},
+		{".doc.go1", true, "", "", nil, true},
 	})
 
 	checkPriorities(t, tree)
@@ -176,8 +191,17 @@ func TestTreeWildcard(t *testing.T) {
 		".doc.",
 		".doc.go_faq.html",
 		".doc.go1.html",
+		".doc.*",
+		".doc.go1.*",
+		".doc.go1.html.*",
 		".info.:user.public",
+		".info.:user.project",
 		".info.:user.project.:project",
+		".org.example.www.:user",
+		".org.example.*",
+		".nl.dnssex",
+		".nl.dnssex.*",
+		".nl.dnssex.www",
 	}
 	for _, route := range routes {
 		tree.addRoute(route, false, fakeHandler(route))
@@ -186,20 +210,28 @@ func TestTreeWildcard(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", false, ".", nil, false},
-		{".cmd.test.", false, ".cmd.:tool.", Params{Param{"tool", "test"}}, false},
-		{".cmd.test", true, "", Params{Param{"tool", "test"}}, true},
-		{".cmd.test.3", false, ".cmd.:tool.:sub", Params{Param{"tool", "test"}, Param{"sub", "3"}}, false},
-		{".src.", false, ".src.*filename", Params{Param{"filename", "."}}, false},
-		{".src.some.file.png", false, ".src.*filename", Params{Param{"filename", ".some.file.png"}}, false},
-		{".search.", false, ".search.", nil, false},
-		{".search.someth!ng+in+ünìcodé", false, ".search.:query", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
-		{".search.someth!ng+in+ünìcodé.", true, "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
-		{".user_gopher", false, ".user_:name", Params{Param{"name", "gopher"}}, false},
-		{".user_gopher.about", false, ".user_:name.about", Params{Param{"name", "gopher"}}, false},
-		{".files.js.inc.framework.js", false, ".files.:dir.*filename", Params{Param{"dir", "js"}, Param{"filename", ".inc.framework.js"}}, false},
-		{".info.gordon.public", false, ".info.:user.public", Params{Param{"user", "gordon"}}, false},
-		{".info.gordon.project.go", false, ".info.:user.project.:project", Params{Param{"user", "gordon"}, Param{"project", "go"}}, false},
+		{".", false, ".", "", nil, false},
+		{".cmd.test.", false, ".cmd.:tool.", "", Params{Param{"tool", "test"}}, false},
+		{".cmd.test", true, "", "", Params{Param{"tool", "test"}}, true},
+		{".cmd.test.3", false, ".cmd.:tool.:sub", "", Params{Param{"tool", "test"}, Param{"sub", "3"}}, false},
+		{".src.", false, ".src.*filename", "", Params{Param{"filename", "."}}, false},
+		{".src.some.file.png", false, ".src.*filename", "", Params{Param{"filename", ".some.file.png"}}, false},
+		{".search.", false, ".search.", "", nil, false},
+		{".search.someth!ng+in+ünìcodé", false, ".search.:query", "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".search.someth!ng+in+ünìcodé.", true, "", "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".user_gopher", false, ".user_:name", "", Params{Param{"name", "gopher"}}, false},
+		{".user_gopher.about", false, ".user_:name.about", "", Params{Param{"name", "gopher"}}, false},
+		{".files.js.inc.framework.js", false, ".files.:dir.*filename", "", Params{Param{"dir", "js"}, Param{"filename", ".inc.framework.js"}}, false},
+		{".info.gordon.public", false, ".info.:user.public", "", Params{Param{"user", "gordon"}}, false},
+		{".info.gordon.project.go", false, ".info.:user.project.:project", "", Params{Param{"user", "gordon"}, Param{"project", "go"}}, false},
+		{".doc.go1", false, ".doc.*", "", Params{Param{"", "go1"}}, false},
+		{".doc.go1.html", false, ".doc.go1.html", "", nil, false},
+		{".doc.go1.xml", false, ".doc.go1.*", "", Params{Param{"", "xml"}}, false},
+		{".doc.go1.html.hello.world", false, ".doc.go1.html.*", "", Params{Param{"", "hello.world"}}, false},
+		{".org.example.www.jobs.steve", false, ".org.example.*", "", Params{Param{"", "www.jobs.steve"}}, false},
+		{".org.example.www.jobs", false, ".org.example.www.:user", "", Params{Param{"user", "jobs"}}, false},
+		{".org.example", true, "", "", nil, true},
+		{".nl.dnssex.wild", false, ".nl.dnssex.*", "", Params{Param{"", "wild"}}, false},
 	})
 
 	checkPriorities(t, tree)
@@ -225,7 +257,7 @@ func testRoutes(t *testing.T, routes []testRoute) {
 
 	for _, route := range routes {
 		recv := catchPanic(func() {
-			tree.addRoute(route.name, false, nodeHandlerElement{})
+			tree.addRoute(route.name, false, typeHandler{})
 		})
 
 		if route.conflict {
@@ -245,6 +277,7 @@ func TestTreeWildcardConflict(t *testing.T) {
 		{".cmd.:tool.:sub", false},
 		{".cmd.vet", true},
 		{".src", false},
+		{".*", false},
 		{".src.*filename", false},
 		{".src.*filenamex", true},
 		{".src.", true},
@@ -298,7 +331,7 @@ func TestTreeDupliateName(t *testing.T) {
 
 		// Add again
 		recv = catchPanic(func() {
-			tree.addRoute(route, false, nodeHandlerElement{})
+			tree.addRoute(route, false, typeHandler{})
 		})
 		if recv == nil {
 			t.Fatalf("no panic while inserting duplicate route '%s", route)
@@ -306,7 +339,7 @@ func TestTreeDupliateName(t *testing.T) {
 
 		// Add again
 		recv = catchPanic(func() {
-			tree.addRoute(route, true, nodeHandlerElement{})
+			tree.addRoute(route, true, typeHandler{})
 		})
 		if recv != nil {
 			t.Fatalf("panic inserting duplicate route '%s': %v", route, recv)
@@ -317,11 +350,11 @@ func TestTreeDupliateName(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", false, ".", nil, false},
-		{".doc.", false, ".doc.", nil, false},
-		{".src.some.file.png", false, ".src.*filename", Params{Param{"filename", ".some.file.png"}}, false},
-		{".search.someth!ng+in+ünìcodé", false, ".search.:query", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
-		{".user_gopher", false, ".user_:name", Params{Param{"name", "gopher"}}, false},
+		{".", false, ".", "", nil, false},
+		{".doc.", false, ".doc.", "", nil, false},
+		{".src.some.file.png", false, ".src.*filename", "", Params{Param{"filename", ".some.file.png"}}, false},
+		{".search.someth!ng+in+ünìcodé", false, ".search.:query", "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".user_gopher", false, ".user_:name", "", Params{Param{"name", "gopher"}}, false},
 	})
 }
 
@@ -332,11 +365,10 @@ func TestEmptyWildcardName(t *testing.T) {
 		".user:",
 		".user:.",
 		".cmd.:.",
-		".src.*",
 	}
 	for _, route := range routes {
 		recv := catchPanic(func() {
-			tree.addRoute(route, false, nodeHandlerElement{})
+			tree.addRoute(route, false, typeHandler{})
 		})
 		if recv == nil {
 			t.Fatalf("no panic while inserting route with empty wildcard name '%s", route)
@@ -373,7 +405,7 @@ func TestTreeDoubleWildcard(t *testing.T) {
 	for _, route := range routes {
 		tree := &node{}
 		recv := catchPanic(func() {
-			tree.addRoute(route, false, nodeHandlerElement{})
+			tree.addRoute(route, false, typeHandler{})
 		})
 
 		if rs, ok := recv.(string); !ok || !strings.HasPrefix(rs, panicMsg) {
@@ -580,5 +612,194 @@ func TestTreeWildcardConflictEx(t *testing.T) {
 		if !regexp.MustCompile(fmt.Sprintf("'%s' in new name .* conflicts with existing wildcard '%s' in existing prefix '%s'", conflict.segName, conflict.existSegName, conflict.existName)).MatchString(fmt.Sprint(recv)) {
 			t.Fatalf("invalid wildcard conflict error (%v)", recv)
 		}
+	}
+}
+
+func TestZoneAndDname(t *testing.T) {
+	tree := &node{}
+
+	routes := [...]struct {
+		name  string
+		qtype uint16
+	}{
+		{".org.example", dns.TypeNS},
+		{".org.example", dns.TypeSOA},
+		{".org.example", dns.TypeA},
+		{".org.example.a", dns.TypeA},
+		{".org.example.b", dns.TypeA},
+		{".org.example.c.d", dns.TypeNS},
+		{".org.example.c.d", dns.TypeA},
+		{".org.example.c.d.e", dns.TypeA},
+		{".org.example.c.d.e.f", dns.TypeA},
+		{".org.example.c.d.e.*", dns.TypeA},
+		{".org.example.d", dns.TypeDNAME},
+		{".org.example.d", dns.TypeA},
+		{".org.example.d.e", dns.TypeA},
+		{".org.example.d.e.*", dns.TypeA},
+		{".com.example.:user.:sex", dns.TypeNS},
+		{".com.example.:user.:sex", dns.TypeSOA},
+		{".com.example.:user.:sex.:job.:hobby.hi", dns.TypeA},
+		{".com.example.:user.:sex.:job.:hobby.hi", dns.TypeDNAME},
+		{".com.example.:user.:sex.:job.:hobby.hello.*oops", dns.TypeA},
+	}
+
+	for _, route := range routes {
+		h := fakeHandler(route.name)
+		h.Qtype = route.qtype
+		tree.addRoute(route.name, true, h)
+	}
+
+	//printChildren(tree, "")
+
+	checkRequests(t, tree, testRequests{
+		{".", true, "", "", nil, false},
+		{".org", true, "", "", nil, true},
+		{".org.example", false, ".org.example", ".org.example", nil, false},
+		{".org.example.a", false, ".org.example.a", ".org.example", nil, false},
+		{".org.example.b", false, ".org.example.b", ".org.example", nil, false},
+		{".org.example.c", true, "", ".org.example", nil, true},
+		{".org.example.c.d", false, ".org.example.c.d", ".org.example.c.d", nil, false},
+		{".org.example.c.dd", true, "", ".org.example", nil, false},
+		{".org.example.c.e", true, "", ".org.example", nil, false},
+		{".org.example.c.d.e", false, ".org.example.c.d.e", ".org.example.c.d", nil, false},
+		{".org.example.c.d.e.f", false, ".org.example.c.d.e.f", ".org.example.c.d", nil, false},
+		{".org.example.c.d.e.g", false, ".org.example.c.d.e.*", ".org.example.c.d", Params{Param{"", "g"}}, false},
+		{".org.example.d", false, ".org.example.d", ".org.example", nil, false},
+		{".org.example.de", true, "", ".org.example", nil, false},
+		{".org.example.d.e", false, ".org.example.d", ".org.example", nil, true},
+		{".org.example.d.e.f", false, ".org.example.d", ".org.example", nil, true},
+		{
+			".com.example.hannah.female.manager.reading.hi",
+			false,
+			".com.example.:user.:sex.:job.:hobby.hi",
+			".com.example.:user.:sex",
+			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}},
+			false,
+		},
+		{
+			".com.example.hannah.female.manager.reading.hi.oops",
+			false,
+			".com.example.:user.:sex.:job.:hobby.hi",
+			".com.example.:user.:sex",
+			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}},
+			true,
+		},
+		{
+			".com.example.hannah.female.manager.reading.hello.oops",
+			false,
+			".com.example.:user.:sex.:job.:hobby.hello.*oops",
+			".com.example.:user.:sex",
+			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}, Param{"oops", ".oops"}},
+			false,
+		},
+		{
+			".com.example.hannah.female.manager.reading.x",
+			true,
+			"",
+			".com.example.:user.:sex",
+			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}},
+			false,
+		},
+	})
+}
+
+func TestValueRevertParams(t *testing.T) {
+	tree := &node{}
+
+	routes := [...]struct {
+		name  string
+		qtype uint16
+	}{
+		{".org.example.:user.:sex", dns.TypeNS},
+		{".org.example.:user.:sex", dns.TypeSOA},
+		{".org.example.:user.:sex.:job.:hobby.hi", dns.TypeA},
+		{".org.example.:user.:sex.:job.:hobby.hi.*oops", dns.TypeA},
+		{".org.example.:user.:sex.:job.:hobby.hello.*", dns.TypeA},
+	}
+
+	for _, route := range routes {
+		h := fakeHandler(route.name)
+		h.Qtype = route.qtype
+		tree.addRoute(route.name, true, h)
+	}
+
+	//printChildren(tree, "")
+
+	tr := testRequests{
+		{
+			".org.example.hannah.female.manager.reading.hi.how.are.you",
+			false,
+			".org.example.:user.:sex.:job.:hobby.hi.*oops",
+			".org.example.:user.:sex",
+			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}, Param{"oops", ".how.are.you"}},
+			false,
+		},
+		{
+			".org.example.hannah.female.manager.reading.hello.how.are.you",
+			false,
+			".org.example.:user.:sex.:job.:hobby.hello.*",
+			".org.example.:user.:sex",
+			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}, Param{"", "how.are.you"}},
+			false,
+		},
+	}
+	checkRequests(t, tree, tr)
+
+	v := tree.getValue(tr[0].name)
+	params := tr[0].ps
+	zoneParams := tr[0].ps[:2]
+	if !reflect.DeepEqual(v.params, params) {
+		t.Error("expected params:", params, "got:", v.params)
+	}
+	if !reflect.DeepEqual(v.zone.params, zoneParams) {
+		t.Error("expected zone params:", zoneParams, "got:", v.zone.params)
+	}
+
+	revertedParams := Params{
+		Param{"oops", "you.are.how."},
+		Param{"hobby", "reading"},
+		Param{"job", "manager"},
+		Param{"sex", "female"},
+		Param{"user", "hannah"},
+	}
+	revertedZoneParams := Params{
+		Param{"sex", "female"},
+		Param{"user", "hannah"},
+	}
+	v.revertParams()
+	if !reflect.DeepEqual(v.params, revertedParams) {
+		t.Error("expected params:", revertedParams, "got:", v.params)
+	}
+	if !reflect.DeepEqual(v.zone.params, revertedZoneParams) {
+		t.Error("expected zone params:", revertedZoneParams, "got:", v.zone.params)
+	}
+
+	v = tree.getValue(tr[1].name)
+	params = tr[1].ps
+	zoneParams = tr[1].ps[:2]
+	if !reflect.DeepEqual(v.params, params) {
+		t.Error("expected params:", params, "got:", v.params)
+	}
+	if !reflect.DeepEqual(v.zone.params, zoneParams) {
+		t.Error("expected zone params:", zoneParams, "got:", v.zone.params)
+	}
+
+	revertedParams = Params{
+		Param{"", "you.are.how"},
+		Param{"hobby", "reading"},
+		Param{"job", "manager"},
+		Param{"sex", "female"},
+		Param{"user", "hannah"},
+	}
+	revertedZoneParams = Params{
+		Param{"sex", "female"},
+		Param{"user", "hannah"},
+	}
+	v.revertParams()
+	if !reflect.DeepEqual(v.params, revertedParams) {
+		t.Error("expected params:", revertedParams, "got:", v.params)
+	}
+	if !reflect.DeepEqual(v.zone.params, revertedZoneParams) {
+		t.Error("expected zone params:", revertedZoneParams, "got:", v.zone.params)
 	}
 }
