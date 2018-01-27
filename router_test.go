@@ -100,7 +100,7 @@ func TestRouter(t *testing.T) {
 	router := New()
 
 	routed := false
-	router.HandleFunc(":a.:b.org", func(w ResponseWriter, r *Request) {
+	router.HandleFunc(":a.:b.org A", func(w ResponseWriter, r *Request) {
 		routed = true
 		if want, v := "www", r.Params().ByName("a"); v != want {
 			t.Fatalf("wrong wildcard values: want %v, got %v", want, v)
@@ -142,7 +142,7 @@ func TestRouterChaining(t *testing.T) {
 	router1.Middleware = append(router1.Middleware, DefaultScheme...)
 
 	fooHit := false
-	router1.HandleFunc("foo", func(w ResponseWriter, req *Request) {
+	router1.HandleFunc("foo TXT", func(w ResponseWriter, req *Request) {
 		fooHit = true
 		result := w.Msg()
 		txt, err := dns.NewRR("foo TXT")
@@ -153,7 +153,7 @@ func TestRouterChaining(t *testing.T) {
 	})
 
 	barHit := false
-	router2.HandleFunc("bar", func(w ResponseWriter, req *Request) {
+	router2.HandleFunc("bar TXT", func(w ResponseWriter, req *Request) {
 		barHit = true
 		result := w.Msg()
 		txt, err := dns.NewRR("bar TXT")
@@ -164,14 +164,14 @@ func TestRouterChaining(t *testing.T) {
 	})
 
 	w := &responseWriter{}
-	router1.ServeDNS(w, NewRequest("foo", dns.TypeA))
+	router1.ServeDNS(w, NewRequest("foo", dns.TypeTXT))
 	if !(w.msg.Rcode == dns.RcodeSuccess && fooHit) {
 		t.Errorf("Regular routing failed with router chaining.")
 		t.FailNow()
 	}
 
 	w = &responseWriter{}
-	router1.ServeDNS(w, NewRequest("bar", dns.TypeA))
+	router1.ServeDNS(w, NewRequest("bar", dns.TypeTXT))
 	if !(w.msg.Rcode == dns.RcodeSuccess && barHit) {
 		t.Errorf("Chained routing failed with router chaining.")
 		t.FailNow()
@@ -201,7 +201,7 @@ func TestRouterPanicHandler(t *testing.T) {
 	}
 	router.Middleware = []Middleware{panicHandler, BasicHandler}
 
-	router.HandleFunc(":name.user", func(_ ResponseWriter, _ *Request) {
+	router.HandleFunc(":name.user A", func(_ ResponseWriter, _ *Request) {
 		panic("oops!")
 	})
 
@@ -223,18 +223,15 @@ func TestRouterPanicHandler(t *testing.T) {
 
 func TestRouterHandle(t *testing.T) {
 	router := New()
-	router.Handle("", NoErrorHandler)
 	recv := catchPanic(func() {
-		router.Handle("", nil)
+		router.Handle("", NoErrorHandler)
 	})
-	if !strings.Contains(fmt.Sprint(recv), "missing Handler") {
+	if !strings.Contains(fmt.Sprint(recv), "nil RR") {
 		t.Fatal("got error:", recv)
 	}
 
-	router.Handle("example.org", NoErrorHandler)
-
 	recv = catchPanic(func() {
-		router.Handle(" example.org ", nil)
+		router.Handle("example.org", nil)
 	})
 	if !strings.Contains(fmt.Sprint(recv), "not a TTL") {
 		t.Fatal("got error:", recv)
@@ -250,12 +247,12 @@ func TestRouterHandle(t *testing.T) {
 		t.Fatal("got error:", recv)
 	}
 
-	router.Handle(":x.example.org", NoErrorHandler)
-	router.Handle(":x.example.org", NoErrorHandler)
-	router.Handle("x.:x.example.org", NoErrorHandler)
+	router.Handle(":x.example.org A", NoErrorHandler)
+	router.Handle(":x.example.org A", NoErrorHandler)
+	router.Handle("x.:x.example.org A", NoErrorHandler)
 
 	recv = catchPanic(func() {
-		router.Handle(":y.example.org", NoErrorHandler)
+		router.Handle(":y.example.org A", NoErrorHandler)
 	})
 	if !strings.Contains(fmt.Sprint(recv), "existing wildcard ':x'") {
 		t.Fatal("got error:", recv)
@@ -286,7 +283,7 @@ func TestRouterLookup(t *testing.T) {
 	}
 
 	// insert route and try again
-	router.HandleFunc(":name.com", wantHandle)
+	router.HandleFunc(":name.com A", wantHandle)
 
 	router.Lookup("gopher.com", dns.ClassINET).Search(dns.TypeANY).ServeDNS(new(responseWriter), new(Request))
 	if !routed {
@@ -340,9 +337,16 @@ mx		IN	MX      10 a.miek.nl.`
 
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		router.Lookup("www.miek.nl.", dns.ClassINET)
-	}
+	b.Run("with Indexed", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			router.Lookup(".com.google.l.aspmx.alt1", dns.ClassINET)
+		}
+	})
+	b.Run("with Fqdn", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			router.Lookup("alt1.aspmx.l.google.com.", dns.ClassINET)
+		}
+	})
 }
 
 func TestCNAME(t *testing.T) {
@@ -1781,7 +1785,7 @@ sub.example.org.	1800	IN NS	sub1.example.net.
 `
 
 	var dnsTestCases = []testCase{
-		/*{
+		{
 			Qname: "a.delegated.example.org.", Qtype: dns.TypeTXT,
 			Do: true,
 			Ns: []dns.RR{
@@ -1844,7 +1848,7 @@ sub.example.org.	1800	IN NS	sub1.example.net.
 				a("a.delegated.example.org. 1800 IN A 139.162.196.78"),
 				aaaa("a.delegated.example.org. 1800 IN AAAA 2a01:7e00::f03c:91ff:fef1:6735"),
 			},
-		},*/
+		},
 		{
 			Qname: "delegated.example.org.", Qtype: dns.TypeDS,
 			Do: true,

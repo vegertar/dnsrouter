@@ -4,18 +4,19 @@ import "github.com/miekg/dns"
 
 // A Stub is a name server.
 type Stub interface {
-	Lookup(name string, qclass uint16) Class
+	Lookup(name string, qclass uint16) (class Class)
 }
 
 // A Class is acquired from a Stub via an arbitrary name with a class.
 type Class interface {
-	Zone() (c Class, delegated bool)
-	NextSecure(nsecType uint16) Class
-	Search(qtype uint16) Handler
-	Invert() Stub
+	NextSecure(nsecType uint16) (nsec Class)
+	Search(qtype uint16) (h Handler)
+	Stub() (stub Stub)
+	Zone() (zone Class, delegated bool)
 }
 
-// CheckRedirect is useful for checking if occurs DNAME or CNAME redirection.
+// CheckRedirect is useful for checking type assertion on a Handle that
+// returned from a Search if which occurs DNAME or CNAME redirection.
 type CheckRedirect interface {
 	Qtype() uint16
 }
@@ -41,7 +42,7 @@ type basicClass struct {
 }
 
 func (c basicClass) isAvailable() bool {
-	return c.handler != nil || c.cut && c.zone.node != nil
+	return c.handler != nil || c.cut && len(c.zones) > 0
 }
 
 func (c basicClass) Search(qtype uint16) Handler {
@@ -95,11 +96,13 @@ func (c basicClass) Search(qtype uint16) Handler {
 }
 
 func (c basicClass) Zone() (Class, bool) {
-	if c.zone.node != nil {
-		c.handler = c.zone.node.data.handler
-		c.params = c.zone.params
+	if i := len(c.zones); i > 0 {
+		zone := c.zones[i-1]
+		c.handler = zone.node.data.handler
+		c.params = zone.params
+		c.zones = c.zones[:i-1]
 		c.cut = false
-		return c, c.zone.node.data.rrType&rrSoa == 0
+		return c, zone.node.data.rrType&rrSoa == 0
 	}
 	return nil, false
 }
@@ -108,7 +111,7 @@ func (c basicClass) NextSecure(_ uint16) Class {
 	return nil
 }
 
-func (c basicClass) Invert() Stub {
+func (c basicClass) Stub() Stub {
 	return c.stub
 }
 

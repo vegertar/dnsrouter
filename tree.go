@@ -176,26 +176,26 @@ func (p *nodeData) addHandler(h typeHandler) {
 	}
 }
 
+type zone struct {
+	node   *node
+	params Params
+}
+
 type value struct {
 	node   *node
 	params Params
-	cut    bool // cut means search stopped by a dot
-	zone   struct {
-		node   *node
-		params Params
-	}
+	// cut means search stopped by a dot
+	cut bool
+	// zones is met zones from up to down while searching name
+	zones []zone
 }
 
 // TODO: this is a NSEC-specific lookup.
 func (v value) getPrevNode() *node {
-	if v.zone.node == nil {
-		return nil
-	}
-
 	return nil
 }
 
-// this is used to revert params according to indexable domain
+// revertParams reverts params according to indexable domain
 func (v *value) revertParams() {
 	for i, param := range v.params {
 		if dns.CountLabel(param.Value) > 1 {
@@ -206,8 +206,12 @@ func (v *value) revertParams() {
 		v.params[i], v.params[j] = v.params[j], v.params[i]
 	}
 
-	if len(v.zone.params) < len(v.params) {
-		v.zone.params = v.params[len(v.params)-len(v.zone.params):]
+	for i, zone := range v.zones {
+		if len(zone.params) < len(v.params) {
+			v.zones[i].params = v.params[len(v.params)-len(zone.params):]
+		} else {
+			break
+		}
 	}
 }
 
@@ -514,24 +518,30 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler typeH
 	n.data.addHandler(handler)
 }
 
-// Returns the handler registered with the given name (key). The values of
-// wildcards are saved to a map. The third returned value cut indicating whether
-// the searching is ending at a cut of a name.
+// Returns the handler registered with the given name (key).
 func (n *node) getValue(name string) (v value) {
 	var (
-		end            int
+		end int
+		p   Params
+
+		// fallback variables are relative to anonymous wildcards.
+		fallback       bool
 		fallbackNode   *node
 		fallbackName   string
 		fallbackParams Params
-		fallback       bool
-		p              Params
 	)
 
 	defer func() {
 		v.params = p
 
 		if v.node != nil && v.node.data.rrType&rrZone > 0 {
-			v.zone.node, v.zone.params = n, p
+			if v.zones == nil {
+				v.zones = make([]zone, 0, dns.CountLabel(name)+1)
+			}
+			i := len(v.zones)
+			v.zones = v.zones[:i+1] // expand slice within preallocated capacity
+			v.zones[i].node = n
+			v.zones[i].params = p
 		}
 
 		if v.node == nil {
@@ -557,7 +567,13 @@ walk: // outer loop for walking the tree
 
 			if n.data != nil && strings.HasPrefix(name, ".") {
 				if n.data.rrType&rrZone > 0 {
-					v.zone.node, v.zone.params = n, p
+					if v.zones == nil {
+						v.zones = make([]zone, 0, dns.CountLabel(name)+1)
+					}
+					i := len(v.zones)
+					v.zones = v.zones[:i+1] // expand slice within preallocated capacity
+					v.zones[i].node = n
+					v.zones[i].params = p
 				}
 
 				if n.data.rrType&rrDname > 0 {
@@ -611,11 +627,17 @@ walk: // outer loop for walking the tree
 				p[i].Key = n.name[1:]
 				p[i].Value = name[:end]
 
-				// we need to go deeper!
+				// we need to go deeper! end is stopped by dot
 				if end < len(name) {
 					if n.data != nil {
 						if n.data.rrType&rrZone > 0 {
-							v.zone.node, v.zone.params = n, p
+							if v.zones == nil {
+								v.zones = make([]zone, 0, dns.CountLabel(name)+1)
+							}
+							i := len(v.zones)
+							v.zones = v.zones[:i+1] // expand slice within preallocated capacity
+							v.zones[i].node = n
+							v.zones[i].params = p
 						}
 
 						if n.data.rrType&rrDname > 0 {

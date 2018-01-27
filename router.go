@@ -36,26 +36,26 @@ func New() *Router {
 }
 
 // Handle registers a new request handler with the given domain or RR in string.
-// Only a domain that beginning with a single asterisk (*) is treated as
-// wildcard (https://tools.ietf.org/html/rfc4592),
-// in other cases, wild card labels are treated as same as path components used in
-// httprouter (https://github.com/julienschmidt/httprouter).
+// Only a domain that beginning with a single asterisk (*) is treated as wildcard
+// (https://tools.ietf.org/html/rfc4592), in other cases, wildcard labels or
+// named parameters are treated as same as path components used in httprouter
+// (https://github.com/julienschmidt/httprouter).
 // If s is a literal string which is able to create a dns.RR by dns.NewRR, the
 // handler is optional and defaults to write the resulted record into answer section.
-// If s is just a valid domain name, then the handler is registered as an INET class
-// with an unspecified type.
+// Please pay attention that Handle won't check if the given string contains an actual
+// record data, e.g. "github.com A" is legal to pass to Handle, so calling
+// Handle("github.com A", nil) causes a strange RR "github.com. 3600 IN A " in ANSWER section.
 func (r *Router) Handle(s string, handler Handler) {
-	if !strings.ContainsAny(s, " \t\n") {
-		r.handle(dns.Fqdn(s), dns.ClassINET, 0, 0, handler)
-		return
-	}
-
 	rr, err := dns.NewRR(s)
 	if err != nil {
 		panic(err)
 	}
 	if handler == nil {
 		handler = Answer(rr)
+	}
+
+	if rr == nil {
+		panic("nil RR: " + s)
 	}
 
 	hdr := rr.Header()
@@ -135,7 +135,7 @@ func (r *Router) nsecPrevious(name string, qclass, qtype uint16) string {
 	return previous
 }
 
-// Lookup allows the manual lookup of a class in which would never be nil.
+// Lookup implements Stub interface, this method would never return nil.
 func (r *Router) Lookup(name string, qclass uint16) Class {
 	var c basicClass
 	c.stub = r
@@ -160,7 +160,7 @@ func (r *Router) ServeDNS(resp ResponseWriter, req *Request) {
 	if middleware == nil {
 		middleware = DefaultScheme
 	}
-	chainHandler(NoErrorHandler, middleware...).ServeDNS(resp, req.WithContext(ctx))
+	ChainHandler(NoErrorHandler, middleware...).ServeDNS(resp, req.WithContext(ctx))
 }
 
 func newIndexableName(name string) string {

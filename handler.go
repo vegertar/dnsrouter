@@ -155,22 +155,18 @@ func BasicHandler(h Handler) Handler {
 		}
 
 		qtype := req.Question[0].Qtype
-		if existsAny(result.Answer, dns.TypeCNAME, qtype) ||
+		if ExistsAny(result.Answer, dns.TypeCNAME, qtype) ||
 			qtype == dns.TypeANY && len(result.Answer) > 0 {
 			return
 		}
 
-		var class Class
+		var class, rrsig Class
+
 		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
 			class = classValue.(Class)
 		} else {
 			return
 		}
-
-		var (
-			rrsig             Class
-			h, sig, ds, dsSig Handler
-		)
 
 		if opt := req.IsEdns0(); opt != nil && opt.Do() {
 			if qtype != dns.TypeRRSIG && qtype != dns.TypeANY {
@@ -180,32 +176,15 @@ func BasicHandler(h Handler) Handler {
 			}
 		}
 
-		if qtype == dns.TypeANY {
-			h = class.Search(dns.TypeANY)
-		} else {
-			if qtype == dns.TypeNS {
-				// might be a delegation
-				//ds = class.Search(dns.TypeDS)
-				//if rrsig != nil {
-				//dsSig = rrsig.Search(dns.TypeDS)
-				//}
+		h := class.Search(qtype)
+		if rrsig != nil {
+			if t, ok := h.(CheckRedirect); ok {
+				qtype = t.Qtype()
 			}
-
-			h = class.Search(qtype)
-			if rcode, ok := h.(RcodeHandler); ok && rcode == NoErrorHandler {
-				h = class.Search(0)
+			sig := rrsig.Search(qtype)
+			if sig != nil {
+				h = MultipleHandler(h, sig)
 			}
-
-			if rrsig != nil {
-				if t, ok := h.(CheckRedirect); ok {
-					qtype = t.Qtype()
-				}
-				sig = rrsig.Search(qtype)
-			}
-		}
-
-		if sig != nil || ds != nil || dsSig != nil {
-			h = MultipleHandler(h, sig, ds, dsSig)
 		}
 
 		h.ServeDNS(w, req)
@@ -223,7 +202,7 @@ func CnameHandler(h Handler) Handler {
 			result = w.Msg()
 		)
 
-		if i := first(result.Answer, dns.TypeDNAME); i != -1 {
+		if i := First(result.Answer, dns.TypeDNAME); i != -1 {
 			dname := result.Answer[i].(*dns.DNAME)
 			owner := dname.Hdr.Name
 			diff := len(qname) - len(owner)
@@ -246,7 +225,7 @@ func CnameHandler(h Handler) Handler {
 
 		var stub Stub
 		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
-			stub = classValue.(Class).Invert()
+			stub = classValue.(Class).Stub()
 		}
 		if stub == nil {
 			return
@@ -291,7 +270,7 @@ func ExtraHandler(h Handler) Handler {
 		if result := w.Msg(); len(result.Extra) == 0 && len(result.Answer) > 0 {
 			var stub Stub
 			if classValue := req.Context().Value(ClassContextKey); classValue != nil {
-				stub = classValue.(Class).Invert()
+				stub = classValue.(Class).Stub()
 			}
 			if stub == nil {
 				return
@@ -344,11 +323,11 @@ func NsHandler(h Handler) Handler {
 
 		if qtype == dns.TypeANY ||
 			result.Rcode != dns.RcodeNameError && result.Rcode != dns.RcodeSuccess ||
-			existsAny(result.Ns, dns.TypeNS, dns.TypeSOA) {
+			ExistsAny(result.Ns, dns.TypeNS, dns.TypeSOA) {
 			return
 		}
 
-		hasData := existsAny(result.Answer, qtype, dns.TypeCNAME)
+		hasData := ExistsAny(result.Answer, qtype, dns.TypeCNAME)
 
 		var class Class
 		if classValue := req.Context().Value(ClassContextKey); classValue != nil {
@@ -362,11 +341,31 @@ func NsHandler(h Handler) Handler {
 				result.Authoritative = false
 				if hasData && qtype == dns.TypeNS {
 					result.Answer, result.Ns = result.Ns, result.Answer
+
+					// adding DS records
+					if opt := req.IsEdns0(); opt != nil && opt.Do() {
+						ctx := context.WithValue(req.Context(), ClassContextKey, zone)
+						m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, dns.TypeDS, h)
+						result.Ns = append(result.Ns, m.Answer...)
+					}
 					return
 				}
 
-				// clears data for delegation
-				result.Answer = nil
+				// clears data for delegation except DS
+				if hasData {
+					if qtype != dns.TypeDS {
+						result.Answer = nil
+						hasData = false
+					} else {
+						// upgrading zone
+						dsZone, _ := zone.Zone()
+						if dsZone == nil {
+							return
+						}
+						zone = dsZone
+						delegated = true
+					}
+				}
 			} else {
 				result.Authoritative = true
 
@@ -388,6 +387,14 @@ func NsHandler(h Handler) Handler {
 			m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, nsType, h)
 			result.Ns = append(result.Ns, m.Answer...)
 			result.Extra = append(result.Extra, m.Extra...)
+
+			// adding DS records
+			if delegated && !hasData {
+				if opt := req.IsEdns0(); opt != nil && opt.Do() {
+					m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, dns.TypeDS, h)
+					result.Ns = append(result.Ns, m.Answer...)
+				}
+			}
 		}
 	})
 }
@@ -406,7 +413,7 @@ func NsecHandler(h Handler) Handler {
 		}
 
 		result := w.Msg()
-		if existsAny(result.Ns, dns.TypeNSEC, dns.TypeNSEC3) {
+		if ExistsAny(result.Ns, dns.TypeNSEC, dns.TypeNSEC3) {
 			return
 		}
 
@@ -420,7 +427,7 @@ func NsecHandler(h Handler) Handler {
 
 		var nsecType = dns.TypeNSEC
 
-		if i := firstAny(result.Answer, dns.TypeCNAME, req.Question[0].Qtype); i != -1 {
+		if i := FirstAny(result.Answer, dns.TypeCNAME, req.Question[0].Qtype); i != -1 {
 			if isExpandable(result.Answer[i].Header().Name) {
 				nextSecure = class.NextSecure(nsecType)
 			}
@@ -452,7 +459,7 @@ func NsecHandler(h Handler) Handler {
 			return
 		}
 
-		i := first(m.Answer, nsecType)
+		i := First(m.Answer, nsecType)
 		if i == -1 {
 			return
 		}
@@ -589,8 +596,8 @@ func Classic(ctx context.Context, h Handler) dns.Handler {
 	})
 }
 
-// chainHandler applies middlewares on given handler.
-func chainHandler(h Handler, middlewares ...Middleware) Handler {
+// ChainHandler applies middlewares on given handler.
+func ChainHandler(h Handler, middlewares ...Middleware) Handler {
 	for i, n := 0, len(middlewares); i < n; i++ {
 		h = middlewares[n-i-1](h)
 	}
@@ -604,7 +611,7 @@ var (
 		RefusedHandler,
 		OptHandler,
 		WildcardHandler,
-		NsecHandler,
+		//NsecHandler,
 		NsHandler,
 		ExtraHandler,
 		CnameHandler,
@@ -623,15 +630,19 @@ var (
 	}
 )
 
-func exists(rrSet []dns.RR, t uint16) bool {
-	return first(rrSet, t) != -1
+// Exists checks if a given qtype exists.
+func Exists(rrSet []dns.RR, t uint16) bool {
+	return First(rrSet, t) != -1
 }
 
-func existsAny(rrSet []dns.RR, t ...uint16) bool {
-	return firstAny(rrSet, t...) != -1
+// ExistsAny checks if any of given qtypes exists.
+func ExistsAny(rrSet []dns.RR, t ...uint16) bool {
+	return FirstAny(rrSet, t...) != -1
 }
 
-func first(rrSet []dns.RR, t uint16) int {
+// First returns the index of the first element of given qtype.
+// If not found, returns -1.
+func First(rrSet []dns.RR, t uint16) int {
 	for i, rr := range rrSet {
 		if rr.Header().Rrtype == t {
 			return i
@@ -640,7 +651,9 @@ func first(rrSet []dns.RR, t uint16) int {
 	return -1
 }
 
-func firstAny(rrSet []dns.RR, t ...uint16) int {
+// FirstAny returns the index of the first element of any of given qtypes.
+// If not found, returns -1.
+func FirstAny(rrSet []dns.RR, t ...uint16) int {
 	for i, rr := range rrSet {
 		rrType := rr.Header().Rrtype
 		for _, j := range t {

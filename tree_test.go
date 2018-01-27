@@ -39,7 +39,7 @@ type testRequests []struct {
 	name       string
 	nilHandler bool
 	route      string
-	zone       string
+	zones      []string
 	ps         Params
 	cut        bool
 }
@@ -68,14 +68,14 @@ func checkRequests(t *testing.T, tree *node, requests testRequests) {
 			t.Errorf("cut(%v != %v) mismatch for route '%s'", v.cut, request.cut, request.name)
 		}
 
-		if v.zone.node == nil {
-			if request.zone != "" {
-				t.Errorf("zone handle mismatch for route '%s': Expected non-nil zone", request.name)
-			}
+		if len(v.zones) != len(request.zones) {
+			t.Errorf("zones mismatch for route '%s': Expected %d zones, got %d", request.name, len(request.zones), len(v.zones))
 		} else {
-			v.zone.node.data.handler.ServeDNS(nil, nil)
-			if fakeHandlerValue != request.zone {
-				t.Errorf("zone mismatch for route '%s': Wrong zone (%s != %s)", request.name, fakeHandlerValue, request.zone)
+			for i, zone := range v.zones {
+				zone.node.data.handler.ServeDNS(nil, nil)
+				if fakeHandlerValue != request.zones[i] {
+					t.Errorf("zone mismatch for route '%s': Wrong zone %d (%s != %s)", request.name, i, fakeHandlerValue, request.zones[i])
+				}
 			}
 		}
 
@@ -156,19 +156,19 @@ func TestTreeAddAndGet(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".a", false, ".a", "", nil, false},
-		{".", true, "", "", nil, false},
-		{".hi", false, ".hi", "", nil, false},
-		{".contact", false, ".contact", "", nil, false},
-		{".co", false, ".co", "", nil, false},
-		{".con", true, "", "", nil, false},  // key mismatch
-		{".cona", true, "", "", nil, false}, // key mismatch
-		{".no", true, "", "", nil, false},   // no matching child
-		{".ab", false, ".ab", "", nil, false},
-		{".α", false, ".α", "", nil, false},
-		{".β", false, ".β", "", nil, false},
-		{".doc", true, "", "", nil, true},
-		{".doc.go1", true, "", "", nil, true},
+		{".a", false, ".a", nil, nil, false},
+		{".", true, "", nil, nil, false},
+		{".hi", false, ".hi", nil, nil, false},
+		{".contact", false, ".contact", nil, nil, false},
+		{".co", false, ".co", nil, nil, false},
+		{".con", true, "", nil, nil, false},  // key mismatch
+		{".cona", true, "", nil, nil, false}, // key mismatch
+		{".no", true, "", nil, nil, false},   // no matching child
+		{".ab", false, ".ab", nil, nil, false},
+		{".α", false, ".α", nil, nil, false},
+		{".β", false, ".β", nil, nil, false},
+		{".doc", true, "", nil, nil, true},
+		{".doc.go1", true, "", nil, nil, true},
 	})
 
 	checkPriorities(t, tree)
@@ -210,28 +210,28 @@ func TestTreeWildcard(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", false, ".", "", nil, false},
-		{".cmd.test.", false, ".cmd.:tool.", "", Params{Param{"tool", "test"}}, false},
-		{".cmd.test", true, "", "", Params{Param{"tool", "test"}}, true},
-		{".cmd.test.3", false, ".cmd.:tool.:sub", "", Params{Param{"tool", "test"}, Param{"sub", "3"}}, false},
-		{".src.", false, ".src.*filename", "", Params{Param{"filename", "."}}, false},
-		{".src.some.file.png", false, ".src.*filename", "", Params{Param{"filename", ".some.file.png"}}, false},
-		{".search.", false, ".search.", "", nil, false},
-		{".search.someth!ng+in+ünìcodé", false, ".search.:query", "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
-		{".search.someth!ng+in+ünìcodé.", true, "", "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
-		{".user_gopher", false, ".user_:name", "", Params{Param{"name", "gopher"}}, false},
-		{".user_gopher.about", false, ".user_:name.about", "", Params{Param{"name", "gopher"}}, false},
-		{".files.js.inc.framework.js", false, ".files.:dir.*filename", "", Params{Param{"dir", "js"}, Param{"filename", ".inc.framework.js"}}, false},
-		{".info.gordon.public", false, ".info.:user.public", "", Params{Param{"user", "gordon"}}, false},
-		{".info.gordon.project.go", false, ".info.:user.project.:project", "", Params{Param{"user", "gordon"}, Param{"project", "go"}}, false},
-		{".doc.go1", false, ".doc.*", "", Params{Param{"", "go1"}}, false},
-		{".doc.go1.html", false, ".doc.go1.html", "", nil, false},
-		{".doc.go1.xml", false, ".doc.go1.*", "", Params{Param{"", "xml"}}, false},
-		{".doc.go1.html.hello.world", false, ".doc.go1.html.*", "", Params{Param{"", "hello.world"}}, false},
-		{".org.example.www.jobs.steve", false, ".org.example.*", "", Params{Param{"", "www.jobs.steve"}}, false},
-		{".org.example.www.jobs", false, ".org.example.www.:user", "", Params{Param{"user", "jobs"}}, false},
-		{".org.example", true, "", "", nil, true},
-		{".nl.dnssex.wild", false, ".nl.dnssex.*", "", Params{Param{"", "wild"}}, false},
+		{".", false, ".", nil, nil, false},
+		{".cmd.test.", false, ".cmd.:tool.", nil, Params{Param{"tool", "test"}}, false},
+		{".cmd.test", true, "", nil, Params{Param{"tool", "test"}}, true},
+		{".cmd.test.3", false, ".cmd.:tool.:sub", nil, Params{Param{"tool", "test"}, Param{"sub", "3"}}, false},
+		{".src.", false, ".src.*filename", nil, Params{Param{"filename", "."}}, false},
+		{".src.some.file.png", false, ".src.*filename", nil, Params{Param{"filename", ".some.file.png"}}, false},
+		{".search.", false, ".search.", nil, nil, false},
+		{".search.someth!ng+in+ünìcodé", false, ".search.:query", nil, Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".search.someth!ng+in+ünìcodé.", true, "", nil, Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".user_gopher", false, ".user_:name", nil, Params{Param{"name", "gopher"}}, false},
+		{".user_gopher.about", false, ".user_:name.about", nil, Params{Param{"name", "gopher"}}, false},
+		{".files.js.inc.framework.js", false, ".files.:dir.*filename", nil, Params{Param{"dir", "js"}, Param{"filename", ".inc.framework.js"}}, false},
+		{".info.gordon.public", false, ".info.:user.public", nil, Params{Param{"user", "gordon"}}, false},
+		{".info.gordon.project.go", false, ".info.:user.project.:project", nil, Params{Param{"user", "gordon"}, Param{"project", "go"}}, false},
+		{".doc.go1", false, ".doc.*", nil, Params{Param{"", "go1"}}, false},
+		{".doc.go1.html", false, ".doc.go1.html", nil, nil, false},
+		{".doc.go1.xml", false, ".doc.go1.*", nil, Params{Param{"", "xml"}}, false},
+		{".doc.go1.html.hello.world", false, ".doc.go1.html.*", nil, Params{Param{"", "hello.world"}}, false},
+		{".org.example.www.jobs.steve", false, ".org.example.*", nil, Params{Param{"", "www.jobs.steve"}}, false},
+		{".org.example.www.jobs", false, ".org.example.www.:user", nil, Params{Param{"user", "jobs"}}, false},
+		{".org.example", true, "", nil, nil, true},
+		{".nl.dnssex.wild", false, ".nl.dnssex.*", nil, Params{Param{"", "wild"}}, false},
 	})
 
 	checkPriorities(t, tree)
@@ -350,11 +350,11 @@ func TestTreeDupliateName(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", false, ".", "", nil, false},
-		{".doc.", false, ".doc.", "", nil, false},
-		{".src.some.file.png", false, ".src.*filename", "", Params{Param{"filename", ".some.file.png"}}, false},
-		{".search.someth!ng+in+ünìcodé", false, ".search.:query", "", Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
-		{".user_gopher", false, ".user_:name", "", Params{Param{"name", "gopher"}}, false},
+		{".", false, ".", nil, nil, false},
+		{".doc.", false, ".doc.", nil, nil, false},
+		{".src.some.file.png", false, ".src.*filename", nil, Params{Param{"filename", ".some.file.png"}}, false},
+		{".search.someth!ng+in+ünìcodé", false, ".search.:query", nil, Params{Param{"query", "someth!ng+in+ünìcodé"}}, false},
+		{".user_gopher", false, ".user_:name", nil, Params{Param{"name", "gopher"}}, false},
 	})
 }
 
@@ -652,27 +652,27 @@ func TestZoneAndDname(t *testing.T) {
 	//printChildren(tree, "")
 
 	checkRequests(t, tree, testRequests{
-		{".", true, "", "", nil, false},
-		{".org", true, "", "", nil, true},
-		{".org.example", false, ".org.example", ".org.example", nil, false},
-		{".org.example.a", false, ".org.example.a", ".org.example", nil, false},
-		{".org.example.b", false, ".org.example.b", ".org.example", nil, false},
-		{".org.example.c", true, "", ".org.example", nil, true},
-		{".org.example.c.d", false, ".org.example.c.d", ".org.example.c.d", nil, false},
-		{".org.example.c.dd", true, "", ".org.example", nil, false},
-		{".org.example.c.e", true, "", ".org.example", nil, false},
-		{".org.example.c.d.e", false, ".org.example.c.d.e", ".org.example.c.d", nil, false},
-		{".org.example.c.d.e.f", false, ".org.example.c.d.e.f", ".org.example.c.d", nil, false},
-		{".org.example.c.d.e.g", false, ".org.example.c.d.e.*", ".org.example.c.d", Params{Param{"", "g"}}, false},
-		{".org.example.d", false, ".org.example.d", ".org.example", nil, false},
-		{".org.example.de", true, "", ".org.example", nil, false},
-		{".org.example.d.e", false, ".org.example.d", ".org.example", nil, true},
-		{".org.example.d.e.f", false, ".org.example.d", ".org.example", nil, true},
+		{".", true, "", nil, nil, false},
+		{".org", true, "", nil, nil, true},
+		{".org.example", false, ".org.example", []string{".org.example"}, nil, false},
+		{".org.example.a", false, ".org.example.a", []string{".org.example"}, nil, false},
+		{".org.example.b", false, ".org.example.b", []string{".org.example"}, nil, false},
+		{".org.example.c", true, "", []string{".org.example"}, nil, true},
+		{".org.example.c.d", false, ".org.example.c.d", []string{".org.example", ".org.example.c.d"}, nil, false},
+		{".org.example.c.dd", true, "", []string{".org.example"}, nil, false},
+		{".org.example.c.e", true, "", []string{".org.example"}, nil, false},
+		{".org.example.c.d.e", false, ".org.example.c.d.e", []string{".org.example", ".org.example.c.d"}, nil, false},
+		{".org.example.c.d.e.f", false, ".org.example.c.d.e.f", []string{".org.example", ".org.example.c.d"}, nil, false},
+		{".org.example.c.d.e.g", false, ".org.example.c.d.e.*", []string{".org.example", ".org.example.c.d"}, Params{Param{"", "g"}}, false},
+		{".org.example.d", false, ".org.example.d", []string{".org.example"}, nil, false},
+		{".org.example.de", true, "", []string{".org.example"}, nil, false},
+		{".org.example.d.e", false, ".org.example.d", []string{".org.example"}, nil, true},
+		{".org.example.d.e.f", false, ".org.example.d", []string{".org.example"}, nil, true},
 		{
 			".com.example.hannah.female.manager.reading.hi",
 			false,
 			".com.example.:user.:sex.:job.:hobby.hi",
-			".com.example.:user.:sex",
+			[]string{".com.example.:user.:sex"},
 			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}},
 			false,
 		},
@@ -680,7 +680,7 @@ func TestZoneAndDname(t *testing.T) {
 			".com.example.hannah.female.manager.reading.hi.oops",
 			false,
 			".com.example.:user.:sex.:job.:hobby.hi",
-			".com.example.:user.:sex",
+			[]string{".com.example.:user.:sex"},
 			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}},
 			true,
 		},
@@ -688,7 +688,7 @@ func TestZoneAndDname(t *testing.T) {
 			".com.example.hannah.female.manager.reading.hello.oops",
 			false,
 			".com.example.:user.:sex.:job.:hobby.hello.*oops",
-			".com.example.:user.:sex",
+			[]string{".com.example.:user.:sex"},
 			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}, Param{"oops", ".oops"}},
 			false,
 		},
@@ -696,7 +696,7 @@ func TestZoneAndDname(t *testing.T) {
 			".com.example.hannah.female.manager.reading.x",
 			true,
 			"",
-			".com.example.:user.:sex",
+			[]string{".com.example.:user.:sex"},
 			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}},
 			false,
 		},
@@ -714,6 +714,7 @@ func TestValueRevertParams(t *testing.T) {
 		{".org.example.:user.:sex", dns.TypeSOA},
 		{".org.example.:user.:sex.:job.:hobby.hi", dns.TypeA},
 		{".org.example.:user.:sex.:job.:hobby.hi.*oops", dns.TypeA},
+		{".org.example.:user.:sex.:job.:hobby.hello", dns.TypeNS},
 		{".org.example.:user.:sex.:job.:hobby.hello.*", dns.TypeA},
 	}
 
@@ -730,7 +731,7 @@ func TestValueRevertParams(t *testing.T) {
 			".org.example.hannah.female.manager.reading.hi.how.are.you",
 			false,
 			".org.example.:user.:sex.:job.:hobby.hi.*oops",
-			".org.example.:user.:sex",
+			[]string{".org.example.:user.:sex"},
 			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}, Param{"oops", ".how.are.you"}},
 			false,
 		},
@@ -738,7 +739,7 @@ func TestValueRevertParams(t *testing.T) {
 			".org.example.hannah.female.manager.reading.hello.how.are.you",
 			false,
 			".org.example.:user.:sex.:job.:hobby.hello.*",
-			".org.example.:user.:sex",
+			[]string{".org.example.:user.:sex", ".org.example.:user.:sex.:job.:hobby.hello"},
 			Params{Param{"user", "hannah"}, Param{"sex", "female"}, Param{"job", "manager"}, Param{"hobby", "reading"}, Param{"", "how.are.you"}},
 			false,
 		},
@@ -751,8 +752,8 @@ func TestValueRevertParams(t *testing.T) {
 	if !reflect.DeepEqual(v.params, params) {
 		t.Error("expected params:", params, "got:", v.params)
 	}
-	if !reflect.DeepEqual(v.zone.params, zoneParams) {
-		t.Error("expected zone params:", zoneParams, "got:", v.zone.params)
+	if !reflect.DeepEqual(v.zones[0].params, zoneParams) {
+		t.Error("expected zone params:", zoneParams, "got:", v.zones[0].params)
 	}
 
 	revertedParams := Params{
@@ -762,16 +763,20 @@ func TestValueRevertParams(t *testing.T) {
 		Param{"sex", "female"},
 		Param{"user", "hannah"},
 	}
-	revertedZoneParams := Params{
-		Param{"sex", "female"},
-		Param{"user", "hannah"},
+	revertedZoneParams := []Params{
+		Params{Param{"sex", "female"}, Param{"user", "hannah"}},
 	}
 	v.revertParams()
 	if !reflect.DeepEqual(v.params, revertedParams) {
 		t.Error("expected params:", revertedParams, "got:", v.params)
 	}
-	if !reflect.DeepEqual(v.zone.params, revertedZoneParams) {
-		t.Error("expected zone params:", revertedZoneParams, "got:", v.zone.params)
+	if len(v.zones) != len(revertedZoneParams) {
+		t.Errorf("expected %d zone params, got %d", len(revertedZoneParams), len(v.zones))
+	}
+	for i, params := range revertedZoneParams {
+		if !reflect.DeepEqual(v.zones[i].params, params) {
+			t.Errorf("expected %d zone params %v , got %v", i, params, v.zones[i].params)
+		}
 	}
 
 	v = tree.getValue(tr[1].name)
@@ -780,8 +785,8 @@ func TestValueRevertParams(t *testing.T) {
 	if !reflect.DeepEqual(v.params, params) {
 		t.Error("expected params:", params, "got:", v.params)
 	}
-	if !reflect.DeepEqual(v.zone.params, zoneParams) {
-		t.Error("expected zone params:", zoneParams, "got:", v.zone.params)
+	if !reflect.DeepEqual(v.zones[0].params, zoneParams) {
+		t.Error("expected zone params:", zoneParams, "got:", v.zones[0].params)
 	}
 
 	revertedParams = Params{
@@ -791,15 +796,20 @@ func TestValueRevertParams(t *testing.T) {
 		Param{"sex", "female"},
 		Param{"user", "hannah"},
 	}
-	revertedZoneParams = Params{
-		Param{"sex", "female"},
-		Param{"user", "hannah"},
+	revertedZoneParams = []Params{
+		Params{Param{"sex", "female"}, Param{"user", "hannah"}},
+		Params{Param{"hobby", "reading"}, Param{"job", "manager"}, Param{"sex", "female"}, Param{"user", "hannah"}},
 	}
 	v.revertParams()
 	if !reflect.DeepEqual(v.params, revertedParams) {
 		t.Error("expected params:", revertedParams, "got:", v.params)
 	}
-	if !reflect.DeepEqual(v.zone.params, revertedZoneParams) {
-		t.Error("expected zone params:", revertedZoneParams, "got:", v.zone.params)
+	if len(v.zones) != len(revertedZoneParams) {
+		t.Errorf("expected %d zone params, got %d", len(revertedZoneParams), len(v.zones))
+	}
+	for i, params := range revertedZoneParams {
+		if !reflect.DeepEqual(v.zones[i].params, params) {
+			t.Errorf("expected %d zone params %v , got %v", i, params, v.zones[i].params)
+		}
 	}
 }
