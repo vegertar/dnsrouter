@@ -49,7 +49,7 @@ func min(a, b int) int {
 func countParams(name string) uint8 {
 	var n uint
 	for i := 0; i < len(name); i++ {
-		if c := name[i]; c != ':' && c != '*' || c == '*' && i+1 == len(name) {
+		if c := name[i]; c != ':' && c != '*' {
 			continue
 		}
 		n++
@@ -67,6 +67,7 @@ const (
 	root
 	param
 	catchAll
+	anonymousCatchAll
 )
 
 type wildChildType uint8
@@ -176,7 +177,8 @@ func (p *nodeData) addHandler(h typeHandler) {
 	}
 }
 
-type zone struct {
+type milestone struct {
+	name   string
 	node   *node
 	params Params
 }
@@ -184,14 +186,96 @@ type zone struct {
 type value struct {
 	node   *node
 	params Params
+
+	// nearest is the nearest node while searching the target name
+	nearest milestone
 	// cut means search stopped by a dot
 	cut bool
 	// zones is met zones from up to down while searching name
-	zones []zone
+	zones []milestone
 }
 
-// TODO: this is a NSEC-specific lookup.
-func (v value) getPrevNode() *node {
+// previous returns a previous node by canonical order
+func (v value) previous(route string) *node {
+	if v.nearest.name == "" {
+		return nil
+	}
+
+	node := v.nearest.node
+	name := v.nearest.name
+
+	if (v.node == nil || v.node.name == "*") && node != nil && name != "" {
+		c := name[0]
+		index := -1
+
+		for i := 0; i < len(node.indices); i++ {
+			if node.indices[i] == c {
+				index = i
+				if node.wildChild == anonymousWildChild {
+					// 1st child is reserved for '*'
+					index++
+				}
+				break
+			}
+		}
+
+		if index != -1 {
+			child := node.children[index]
+			if child.name < name {
+				return child.getMax()
+			}
+		}
+	}
+
+up:
+	if node != nil {
+		var chars [255]uint16
+
+		c := name[0]
+		if node.wildChild == anonymousWildChild && c > '*' {
+			chars['*'] = 1
+		}
+
+		for i := 0; i < len(node.indices); i++ {
+			ch := node.indices[i]
+			if ch < c {
+				j := i + 1
+				if node.wildChild == anonymousWildChild {
+					// 1st child is reserved for '*'
+					j++
+				}
+				chars[ch] = uint16(j)
+			}
+		}
+
+		index := -1
+		for i := len(chars) - 1; i >= 0; i-- {
+			if j := chars[i]; j > 0 {
+				index = int(j - 1)
+				break
+			}
+		}
+		if index != -1 {
+			return node.children[index].getMax()
+		}
+
+		for node.data == nil && node.parent != nil {
+			child := node
+			node = node.parent
+
+			if child.name != "" {
+				name = child.name
+				goto up
+			}
+		}
+
+		if node.data != nil {
+			return node
+		}
+
+		return node.getMax()
+	}
+
 	return nil
 }
 
@@ -222,20 +306,26 @@ type node struct {
 	maxParams uint8
 	indices   string
 	children  []*node
+	parent    *node
 	data      *nodeData
 	priority  uint32
 }
 
 // increments priority of the given child and reorders if necessary
 func (n *node) incrementChildPrio(pos int) int {
-	n.children[pos].priority++
-	prio := n.children[pos].priority
+	children := n.children
+	if n.wildChild != noWildChild {
+		// since indices doesn't contain wildcard, so has to step forward 1 child
+		children = children[1:]
+	}
+	children[pos].priority++
+	prio := children[pos].priority
 
 	// adjust position (move to front)
 	newPos := pos
 	for newPos > 0 && n.children[newPos-1].priority < prio {
 		// swap node positions
-		n.children[newPos-1], n.children[newPos] = n.children[newPos], n.children[newPos-1]
+		children[newPos-1], children[newPos] = children[newPos], children[newPos-1]
 
 		newPos--
 	}
@@ -247,13 +337,17 @@ func (n *node) incrementChildPrio(pos int) int {
 			n.indices[newPos:pos] + n.indices[pos+1:] // rest without char at 'pos'
 	}
 
+	if n.wildChild != noWildChild {
+		// since index 0 is reserved for wildChild, so makes a increase
+		newPos++
+	}
 	return newPos
 }
 
 // addRoute adds a node with the given handler to the name.
 // Not concurrency-safe!
 func (n *node) addRoute(name string, allowDup bool, handler typeHandler) {
-	var anonymousParent *node
+	//var anonymousParent *node
 	fullName := name
 	n.priority++
 	numParams := countParams(name)
@@ -278,12 +372,13 @@ func (n *node) addRoute(name string, allowDup bool, handler typeHandler) {
 
 			// Split edge
 			if i < len(n.name) {
-				child := node{
+				child := &node{
 					name:      n.name[i:],
 					wildChild: n.wildChild,
 					nType:     static,
 					indices:   n.indices,
 					children:  n.children,
+					parent:    n,
 					data:      n.data,
 					priority:  n.priority - 1,
 				}
@@ -293,19 +388,15 @@ func (n *node) addRoute(name string, allowDup bool, handler typeHandler) {
 					if child.children[i].maxParams > child.maxParams {
 						child.maxParams = child.children[i].maxParams
 					}
+					child.children[i].parent = child
 				}
 
-				n.children = []*node{&child}
+				n.children = []*node{child}
 				// []byte for proper unicode char conversion, see #65
 				n.indices = string([]byte{n.name[i]})
 				n.name = name[:i]
 				n.data = nil
 				n.wildChild = noWildChild
-				if anonymousParent != nil {
-					anonymousParent.wildChild = noWildChild
-					n.wildChild = anonymousWildChild
-					anonymousParent = nil
-				}
 			}
 
 			// Make new node a child of this node
@@ -357,31 +448,34 @@ func (n *node) addRoute(name string, allowDup bool, handler typeHandler) {
 				for i := 0; i < len(n.indices); i++ {
 					if c == n.indices[i] {
 						i = n.incrementChildPrio(i)
-						if n.wildChild == anonymousWildChild {
-							anonymousParent = n
-						} else {
-							anonymousParent = nil
-						}
 						n = n.children[i]
 						continue walk
 					}
 				}
 
 				// Otherwise insert it
-				if c != ':' && c != '*' || strings.HasSuffix(name, "*") {
+				if c != ':' && c != '*' {
 					// []byte for proper unicode char conversion, see #65
 					n.indices += string([]byte{c})
-					if strings.HasSuffix(name, "*") {
-						n.wildChild = anonymousWildChild
-					}
 					child := &node{
 						maxParams: numParams,
+						parent:    n,
 					}
 					n.children = append(n.children, child)
 					n.incrementChildPrio(len(n.indices) - 1)
 					n = child
 				}
-				n.insertChild(numParams, name, fullName, handler)
+				if n.wildChild == anonymousWildChild {
+					if !allowDup {
+						panic("a handle is already registered for name '" + fullName + "'")
+					}
+
+					child := n.children[0]
+					child.data.addHandler(handler)
+					child.priority++
+				} else {
+					n.insertChild(numParams, name, fullName, handler)
+				}
 				return
 
 			} else if i == len(name) { // Make node a (in-name) leaf
@@ -424,6 +518,26 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler typeH
 			}
 		}
 
+		// anonymous wildcard
+		if c == '*' && end == max && strings.HasSuffix(fullName, ".*") {
+			// split name at the beginning of the wildcard
+			if i > 0 {
+				n.name = name[offset:i]
+				offset = i
+			}
+
+			child := &node{
+				nType:     anonymousCatchAll,
+				maxParams: numParams,
+				priority:  1,
+				parent:    n,
+			}
+			n.children = append([]*node{child}, n.children...)
+			n.wildChild = anonymousWildChild
+			n = child
+			break
+		}
+
 		// check if this Node existing children which would be
 		// unreachable if we insert the wildcard here
 		if len(n.children) > 0 {
@@ -446,6 +560,7 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler typeH
 			child := &node{
 				nType:     param,
 				maxParams: numParams,
+				parent:    n,
 			}
 			n.children = []*node{child}
 			n.wildChild = namedWildChild
@@ -462,6 +577,7 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler typeH
 				child := &node{
 					maxParams: numParams,
 					priority:  1,
+					parent:    n,
 				}
 				n.children = []*node{child}
 				n = child
@@ -489,6 +605,7 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler typeH
 				wildChild: namedWildChild,
 				nType:     catchAll,
 				maxParams: 1,
+				parent:    n,
 			}
 			n.children = []*node{child}
 			n.indices = string(name[i])
@@ -502,6 +619,7 @@ func (n *node) insertChild(numParams uint8, name, fullName string, handler typeH
 				maxParams: 1,
 				data:      new(nodeData),
 				priority:  1,
+				parent:    n,
 			}
 			child.data.addHandler(handler)
 			n.children = []*node{child}
@@ -524,6 +642,7 @@ func (n *node) getValue(name string) (v value) {
 		end int
 		p   Params
 
+		// TODO: Is there an real case that an asterisk across multiple zones?
 		// fallback variables are relative to anonymous wildcards.
 		fallback       bool
 		fallbackNode   *node
@@ -536,7 +655,7 @@ func (n *node) getValue(name string) (v value) {
 
 		if v.node != nil && v.node.data.rrType&rrZone > 0 {
 			if v.zones == nil {
-				v.zones = make([]zone, 0, dns.CountLabel(name)+1)
+				v.zones = make([]milestone, 0, dns.CountLabel(name)+1)
 			}
 			i := len(v.zones)
 			v.zones = v.zones[:i+1] // expand slice within preallocated capacity
@@ -556,6 +675,9 @@ func (n *node) getValue(name string) (v value) {
 		}
 	}()
 
+	v.nearest.node = n
+	v.nearest.name = name
+
 walk: // outer loop for walking the tree
 	for {
 		if len(name) > len(n.name) && name[:len(n.name)] == n.name {
@@ -565,15 +687,20 @@ walk: // outer loop for walking the tree
 
 			name = name[len(n.name):]
 
+			if !fallback {
+				v.nearest.node, v.nearest.params, v.nearest.name = n, p, name
+			}
+
 			if n.data != nil && strings.HasPrefix(name, ".") {
 				if n.data.rrType&rrZone > 0 {
 					if v.zones == nil {
-						v.zones = make([]zone, 0, dns.CountLabel(name)+1)
+						v.zones = make([]milestone, 0, dns.CountLabel(name)+1)
 					}
 					i := len(v.zones)
 					v.zones = v.zones[:i+1] // expand slice within preallocated capacity
 					v.zones[i].node = n
 					v.zones[i].params = p
+					v.zones[i].name = name
 				}
 
 				if n.data.rrType&rrDname > 0 {
@@ -586,21 +713,23 @@ walk: // outer loop for walking the tree
 			// If this node does not have a wildcard (param or catchAll)
 			// child,  we can just look up the next child node and continue
 			// to walk down the tree
-			if n.wildChild != 1 {
+			if n.wildChild != namedWildChild && !fallback {
 				c := name[0]
-				if fallback {
-					c = '*'
-				}
 
 				for i := 0; i < len(n.indices); i++ {
 					if c == n.indices[i] {
-						n = n.children[i]
+						if n.wildChild != noWildChild {
+							// since indices doesn't contain wildcard, so use the next child
+							n = n.children[i+1]
+						} else {
+							n = n.children[i]
+						}
 						continue walk
 					}
 				}
 
 				// Nothing found.
-				if fallbackNode != nil {
+				if fallbackNode != nil && !fallback {
 					n, name, p, fallback = fallbackNode, fallbackName, fallbackParams, true
 					continue walk
 				}
@@ -619,8 +748,8 @@ walk: // outer loop for walking the tree
 
 				// save param value
 				if p == nil {
-					// lazy allocation, the additional 1 space is reserved for anonymous wildcard
-					p = make(Params, 0, n.maxParams+1)
+					// lazy allocation
+					p = make(Params, 0, n.maxParams)
 				}
 				i := len(p)
 				p = p[:i+1] // expand slice within preallocated capacity
@@ -632,12 +761,13 @@ walk: // outer loop for walking the tree
 					if n.data != nil {
 						if n.data.rrType&rrZone > 0 {
 							if v.zones == nil {
-								v.zones = make([]zone, 0, dns.CountLabel(name)+1)
+								v.zones = make([]milestone, 0, dns.CountLabel(name)+1)
 							}
 							i := len(v.zones)
 							v.zones = v.zones[:i+1] // expand slice within preallocated capacity
 							v.zones[i].node = n
 							v.zones[i].params = p
+							v.zones[i].name = name
 						}
 
 						if n.data.rrType&rrDname > 0 {
@@ -648,6 +778,7 @@ walk: // outer loop for walking the tree
 
 					if len(n.children) > 0 {
 						name = name[end:]
+						v.nearest.node, v.nearest.params, v.nearest.name = n, p, name
 						n = n.children[0]
 						continue walk
 					}
@@ -682,25 +813,7 @@ walk: // outer loop for walking the tree
 				}
 				return
 
-			default:
-				panic("invalid node type")
-			}
-		} else if name == n.name && n.data != nil {
-			// We should have reached the node containing the handle.
-			v.node = n
-		} else {
-			if fallback && n.name == "*" || strings.HasSuffix(n.name, ".*") {
-				if dot := strings.LastIndex(n.name, ".*"); dot != -1 {
-					if len(name) <= dot || name[:dot+1] != n.name[:dot+1] {
-						return
-					}
-					name = name[dot+1:]
-				}
-
-				if n.data != nil {
-					v.node = n
-				}
-
+			case anonymousCatchAll:
 				// save param value
 				if p == nil {
 					// lazy allocation
@@ -709,10 +822,39 @@ walk: // outer loop for walking the tree
 				i := len(p)
 				p = p[:i+1] // expand slice within preallocated capacity
 				p[i].Value = name
-				return
-			}
 
+				if n.data != nil {
+					v.node = n
+				}
+				return
+
+			default:
+				panic("invalid node type")
+			}
+		} else if name == n.name {
+			// We should have reached the node containing the handle.
+			if n.data != nil {
+				v.node = n
+			}
+		} else {
 			if fallback {
+				if n.name == "*" {
+					// save param value
+					if p == nil {
+						// lazy allocation
+						p = make(Params, 0, n.maxParams)
+					}
+					i := len(p)
+					p = p[:i+1] // expand slice within preallocated capacity
+					p[i].Value = name
+
+					if n.data != nil {
+						v.node = n
+					}
+
+					return
+				}
+
 				panic("failed fallback for route: " + n.name + " and name: " + name)
 			}
 
@@ -724,6 +866,32 @@ walk: // outer loop for walking the tree
 
 		return
 	}
+}
+
+// returns the maximum node
+func (n *node) getMax() *node {
+	for n != nil {
+		if len(n.children) == 0 {
+			break
+		}
+
+		if len(n.indices) == 0 {
+			n = n.children[0]
+		} else {
+			i, c := 0, n.indices[0]
+			for j := 1; j < len(n.indices); j++ {
+				if n.indices[j] > c {
+					i, c = j, n.indices[j]
+				}
+			}
+			if n.wildChild != noWildChild {
+				n = n.children[i+1]
+			} else {
+				n = n.children[i]
+			}
+		}
+	}
+	return n
 }
 
 // Makes a case-insensitive lookup of the given name and tries to find a handler.

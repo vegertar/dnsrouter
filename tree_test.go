@@ -15,7 +15,7 @@ import (
 )
 
 func printChildren(n *node, prefix string) {
-	fmt.Printf(" %02v:%02v %v%v[%v] %v %v %v \r\n", n.priority, n.maxParams, prefix, n.name, len(n.children), n.data, n.wildChild, n.nType)
+	fmt.Printf("%02v:%02v %v%v[%v] %v %v %v \r\n", n.priority, n.maxParams, prefix, n.name, len(n.children), n.data, n.wildChild, n.nType)
 	for l := len(n.name); l > 0; l-- {
 		prefix += " "
 	}
@@ -78,7 +78,6 @@ func checkRequests(t *testing.T, tree *node, requests testRequests) {
 				}
 			}
 		}
-
 	}
 }
 
@@ -122,6 +121,18 @@ func checkMaxParams(t *testing.T, n *node) uint8 {
 	}
 
 	return maxParams
+}
+
+func checkParent(t *testing.T, n *node) {
+	for _, child := range n.children {
+		checkParent(t, child)
+		if child.parent != n {
+			t.Errorf(
+				"parent mismatch for node '%s': is %p, should be %p",
+				child.name, child.parent, n,
+			)
+		}
+	}
 }
 
 func TestCountParams(t *testing.T) {
@@ -173,6 +184,7 @@ func TestTreeAddAndGet(t *testing.T) {
 
 	checkPriorities(t, tree)
 	checkMaxParams(t, tree)
+	checkParent(t, tree)
 }
 
 func TestTreeWildcard(t *testing.T) {
@@ -188,11 +200,12 @@ func TestTreeWildcard(t *testing.T) {
 		".user_:name",
 		".user_:name.about",
 		".files.:dir.*filename",
-		".doc.",
-		".doc.go_faq.html",
-		".doc.go1.html",
+		".doc",
 		".doc.*",
+		".doc.g.*",
+		".doc.go_faq.html",
 		".doc.go1.*",
+		".doc.go1.html",
 		".doc.go1.html.*",
 		".info.:user.public",
 		".info.:user.project",
@@ -236,6 +249,7 @@ func TestTreeWildcard(t *testing.T) {
 
 	checkPriorities(t, tree)
 	checkMaxParams(t, tree)
+	checkParent(t, tree)
 }
 
 func catchPanic(testFunc func()) (recv interface{}) {
@@ -811,5 +825,176 @@ func TestValueRevertParams(t *testing.T) {
 		if !reflect.DeepEqual(v.zones[i].params, params) {
 			t.Errorf("expected %d zone params %v , got %v", i, params, v.zones[i].params)
 		}
+	}
+}
+
+func TestValuePrevious(t *testing.T) {
+	tree := &node{}
+
+	routes := [...]struct {
+		name string
+		add  bool
+	}{
+		{".com", true},
+		{".example", true},
+		{".example.*", true},
+		{".example.a", true},
+		{".example.a.yljkjljk123", true},
+		{".example.a.yljkjljl123", true},
+		{".example.a.z", true},
+		{".example.a.zabc", true},
+		{".example.abc", true},
+		{".example.abcd", false},
+		{".example.c", false},
+		{".example.c.d.e.f.g.h", false},
+		{".example.cdefg.dd.e.f.g.h", true},
+		{".example.z", true},
+		{".example.z.\001", true},
+		{".example.z.\001.:p1", true},
+		{".example.z.\001.\002.\003", false},
+		{".example.z.\001.:p1.a1", true},
+		{".example.z.\001.:p1.a1.:p2", true},
+		{".example.z.\001.:p1.a1.:p2.a2", true},
+		{".example.z.\001.:p1.a1.:p2.a2.a3", false},
+		{".example.z.\002.\003", false},
+		{".example.z.\002.\003.\004", false},
+		{".example.z.\002.\003.*", true},
+		{".example.z.\002.\003.all", true},
+		{".example.z.\002.\003.hello", false},
+		{".example.z.\002.\004.*all", true},
+		{".example.z.\002.*", false},
+		{".example.z.*", true},
+		{".example.z.a.b", false},
+		{".example.z.a.b.*", true},
+		{".example.z.a.b.all", true},
+		{".example.z.a.b.c", false},
+		{".example.z.a.b.d1d2", true},
+		{".example.z.a.b.d1d3", false},
+		{".example.z.a.b.d2d4", true},
+		{".example.z.a.c.*all", true},
+		{".example.z.d1d2", true},
+		{".example.z.d1d3", false},
+		{".example.z.d1e4", true},
+		{".example.z.d2d4", true},
+		{".example.z.\200", true},
+		{".examplef", true},
+		{".examplef.abc", true},
+		{".x", false},
+	}
+
+	for _, route := range routes {
+		if route.add {
+			tree.addRoute(route.name, false, fakeHandler(route.name))
+		}
+	}
+
+	//printChildren(tree, "")
+
+	for i, route := range routes {
+		v := tree.getValue(route.name)
+		previous := v.previous(route.name)
+		if previous != nil && previous.data != nil {
+			previous.data.handler.ServeDNS(nil, nil)
+		}
+		if i == 0 {
+			i = len(routes)
+		}
+		i--
+		for !routes[i].add {
+			if i == 0 {
+				i = len(routes)
+			}
+			i--
+		}
+		expectedRoute := routes[i].name
+		if expectedRoute != fakeHandlerValue {
+			t.Errorf("getting previous of route %s, expected %s, got %s", route.name, expectedRoute, fakeHandlerValue)
+		}
+	}
+}
+
+func TestZoneValuePrevious(t *testing.T) {
+	tree := &node{}
+
+	routes := [...]struct {
+		name     string
+		qtype    uint16
+		previous string
+	}{
+		{".com", dns.TypeNS, ".com"},
+		{".example", dns.TypeNS, ".example.abcd"},
+		{".example.*", dns.TypeA, ".example"},
+		{".example.a", dns.TypeA, ".example.*"},
+		{".example.a.yljkjljk123", dns.TypeA, ".example.a"},
+		{".example.a.yljkjljl123", dns.TypeA, ".example.a.yljkjljk123"},
+		{".example.a.z", dns.TypeA, ".example.a.yljkjljl123"},
+		{".example.a.zabc", dns.TypeA, ".example.a.z"},
+		{".example.abc", dns.TypeA, ".example.a.zabc"},
+		{".example.abcd", dns.TypeA, ".example.abc"},
+		{".example.c", dns.TypeNS, ".example.c"},
+		{".example.z", dns.TypeNS, ".example.z.\200"},
+		{".example.z.\001", dns.TypeA, ".example.z"},
+		{".example.z.*", dns.TypeA, ".example.z.\001"},
+		{".example.z.\200", dns.TypeA, ".example.z.*"},
+		{".examplef", dns.TypeNS, ".examplef"},
+	}
+
+	for _, route := range routes {
+		h := fakeHandler(route.name)
+		h.Qtype = route.qtype
+		tree.addRoute(route.name, true, h)
+	}
+
+	//printChildren(tree, "")
+
+	for i, route := range routes {
+		v := tree.getValue(route.name)
+		previous := v.previous(route.name)
+		if previous != nil && previous.data != nil {
+			previous.data.handler.ServeDNS(nil, nil)
+		}
+		expectedRoute := routes[i].previous
+		if expectedRoute != fakeHandlerValue {
+			t.Errorf("getting previous of route %s, expected %s, got %s", route.name, expectedRoute, fakeHandlerValue)
+		}
+	}
+}
+
+func BenchmarkValuePrevious(b *testing.B) {
+	tree := &node{}
+
+	routes := [...]struct {
+		name string
+		add  bool
+	}{
+		{".com", true},
+		{".example", true},
+		{".example.*", true},
+		{".example.a", true},
+		{".example.a.yljkjljk123", true},
+		{".example.a.yljkjljl123", true},
+		{".example.a.z", true},
+		{".example.a.zabc", true},
+		{".example.abc", true},
+		{".example.abcd", false},
+		{".example.c", false},
+		{".example.z", true},
+		{".example.z.\001", true},
+		{".example.z.*", true},
+		{".example.z.\200", true},
+		{".examplef", true},
+	}
+
+	for _, route := range routes {
+		if route.add {
+			tree.addRoute(route.name, false, fakeHandler(route.name))
+		}
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		route := routes[i%len(routes)]
+		tree.getValue(route.name).previous(route.name)
 	}
 }

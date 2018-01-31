@@ -10,9 +10,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// SkipNsecHandler is a tricky code setting in Rcode field of Request for skipping NsecHandler.
-const SkipNsecHandler = -42
-
 // Middleware is a piece of middleware.
 type Middleware func(Handler) Handler
 
@@ -84,7 +81,7 @@ type Handler interface {
 // The HandlerFunc type is an adapter to allow the use of ordinary functions as DNS handlers.
 type HandlerFunc func(ResponseWriter, *Request)
 
-// ServeDNS implements `Handler` interface.
+// ServeDNS implements Handler interface.
 func (f HandlerFunc) ServeDNS(w ResponseWriter, r *Request) {
 	f(w, r)
 }
@@ -116,7 +113,7 @@ func Extra(records ...dns.RR) Handler {
 // RcodeHandler writes an arbitrary response code.
 type RcodeHandler int
 
-// ServeDNS implements `Handler` interface.
+// ServeDNS implements Handler interface.
 func (e RcodeHandler) ServeDNS(w ResponseWriter, r *Request) {
 	w.Msg().Rcode = int(e)
 }
@@ -183,7 +180,7 @@ func BasicHandler(h Handler) Handler {
 			}
 			sig := rrsig.Search(qtype)
 			if sig != nil {
-				h = MultipleHandler(h, sig)
+				h = MultiHandler(h, sig)
 			}
 		}
 
@@ -345,7 +342,7 @@ func NsHandler(h Handler) Handler {
 					// adding DS records
 					if opt := req.IsEdns0(); opt != nil && opt.Do() {
 						ctx := context.WithValue(req.Context(), ClassContextKey, zone)
-						m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, dns.TypeDS, h)
+						m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, dns.TypeDS, WildcardHandler(h))
 						result.Ns = append(result.Ns, m.Answer...)
 					}
 					return
@@ -384,14 +381,14 @@ func NsHandler(h Handler) Handler {
 			}
 
 			ctx := context.WithValue(req.Context(), ClassContextKey, zone)
-			m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, nsType, h)
+			m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, nsType, WildcardHandler(h))
 			result.Ns = append(result.Ns, m.Answer...)
 			result.Extra = append(result.Extra, m.Extra...)
 
 			// adding DS records
 			if delegated && !hasData {
 				if opt := req.IsEdns0(); opt != nil && opt.Do() {
-					m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, dns.TypeDS, h)
+					m := FurtherRequest(w, req.WithContext(ctx), req.Question[0].Name, dns.TypeDS, WildcardHandler(h))
 					result.Ns = append(result.Ns, m.Answer...)
 				}
 			}
@@ -452,7 +449,7 @@ func NsecHandler(h Handler) Handler {
 			nsecSig = nsecRrsig.Search(nsecType)
 		}
 
-		m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultipleHandler(nsec, nsecSig))
+		m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultiHandler(nsec, nsecSig))
 		result.Ns = append(result.Ns, m.Answer...)
 
 		if result.Rcode != dns.RcodeNameError {
@@ -476,7 +473,7 @@ func NsecHandler(h Handler) Handler {
 				zoneNsecSig = zoneRrsig.Search(nsecType)
 			}
 
-			m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultipleHandler(zoneNsec, zoneNsecSig))
+			m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultiHandler(zoneNsec, zoneNsecSig))
 			result.Ns = append(result.Ns, m.Answer...)
 		}
 	})
@@ -555,8 +552,8 @@ func PanicHandler(h Handler) Handler {
 	})
 }
 
-// MultipleHandler merges multiple handlers into a single one.
-func MultipleHandler(m ...Handler) Handler {
+// MultiHandler merges multiple handlers into a single one.
+func MultiHandler(m ...Handler) Handler {
 	return HandlerFunc(func(w ResponseWriter, req *Request) {
 		for _, h := range m {
 			if h != nil {
