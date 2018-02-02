@@ -86,28 +86,15 @@ func (f HandlerFunc) ServeDNS(w ResponseWriter, r *Request) {
 	f(w, r)
 }
 
-// Answer returns a handler which writes records into ANSWER section.
-func Answer(records ...dns.RR) Handler {
-	return HandlerFunc(func(w ResponseWriter, r *Request) {
-		result := w.Msg()
-		result.Answer = append(result.Answer, records...)
-	})
+// Answer is a handler which writes the RR into ANSWER section.
+type Answer struct {
+	dns.RR
 }
 
-// Ns returns a handler which writes records into AUTHORITY section.
-func Ns(records ...dns.RR) Handler {
-	return HandlerFunc(func(w ResponseWriter, r *Request) {
-		result := w.Msg()
-		result.Ns = append(result.Ns, records...)
-	})
-}
-
-// Extra returns a handler which writes records into ADDITIONAL section.
-func Extra(records ...dns.RR) Handler {
-	return HandlerFunc(func(w ResponseWriter, r *Request) {
-		result := w.Msg()
-		result.Extra = append(result.Extra, records...)
-	})
+// ServeDNS implements Handler interface.
+func (a Answer) ServeDNS(w ResponseWriter, r *Request) {
+	result := w.Msg()
+	result.Answer = append(result.Answer, a.RR)
 }
 
 // RcodeHandler writes an arbitrary response code.
@@ -422,10 +409,19 @@ func NsecHandler(h Handler) Handler {
 			return
 		}
 
+		zone, delegated := class.Zone()
+		if zone == nil {
+			return
+		}
+
+		if delegated && Exists(result.Ns, dns.TypeNS) {
+			return
+		}
+
 		var nsecType = dns.TypeNSEC
 
 		if i := FirstAny(result.Answer, dns.TypeCNAME, req.Question[0].Qtype); i != -1 {
-			if isExpandable(result.Answer[i].Header().Name) {
+			if strings.HasPrefix(result.Answer[i].Header().Name, "*.") {
 				nextSecure = class.NextSecure(nsecType)
 			}
 		} else if result.Rcode == dns.RcodeNameError {
@@ -465,17 +461,15 @@ func NsecHandler(h Handler) Handler {
 			return
 		}
 
-		if zone, _ := class.Zone(); zone != nil {
-			var zoneNsec, zoneNsecSig Handler
+		var zoneNsec, zoneNsecSig Handler
 
-			zoneNsec = zone.Search(nsecType)
-			if zoneRrsig, ok := zone.Search(dns.TypeRRSIG).(Class); ok {
-				zoneNsecSig = zoneRrsig.Search(nsecType)
-			}
-
-			m := FurtherRequest(w, req, req.Question[0].Name, nsecType, MultiHandler(zoneNsec, zoneNsecSig))
-			result.Ns = append(result.Ns, m.Answer...)
+		zoneNsec = zone.Search(nsecType)
+		if zoneRrsig, ok := zone.Search(dns.TypeRRSIG).(Class); ok {
+			zoneNsecSig = zoneRrsig.Search(nsecType)
 		}
+
+		m = FurtherRequest(w, req, req.Question[0].Name, nsecType, MultiHandler(zoneNsec, zoneNsecSig))
+		result.Ns = append(result.Ns, m.Answer...)
 	})
 }
 
@@ -608,7 +602,7 @@ var (
 		RefusedHandler,
 		OptHandler,
 		WildcardHandler,
-		//NsecHandler,
+		NsecHandler,
 		NsHandler,
 		ExtraHandler,
 		CnameHandler,
@@ -684,7 +678,7 @@ func expandWildcard(rrSet []dns.RR, qname string, qtype uint16) (wildcardName st
 
 	for i, rr := range rrSet {
 		h := rr.Header()
-		if !isExpandable(h.Name) {
+		if !strings.HasPrefix(h.Name, "*.") {
 			continue
 		}
 
@@ -718,21 +712,6 @@ func expandWildcard(rrSet []dns.RR, qname string, qtype uint16) (wildcardName st
 	}
 
 	return
-}
-
-func isExpandable(name string) bool {
-	for i := 0; i < len(name); i++ {
-		switch name[i] {
-		case ':':
-			return true
-		case '*':
-			// *. or *name
-			if i == 0 || i+1 < len(name) && name[i+1] != '.' {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // see https://gist.github.com/swdunlop/9629168

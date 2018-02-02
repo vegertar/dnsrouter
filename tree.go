@@ -79,6 +79,7 @@ const (
 )
 
 type typeHandler struct {
+	Origin      string
 	Qtype       uint16
 	TypeCovered uint16
 	Handler     Handler
@@ -167,11 +168,23 @@ func (p *nodeData) addHandler(h typeHandler) {
 	if len(p.handler) > 1 {
 		sort.Sort(p.handler)
 	}
+
+	originated := true
+	if a, ok := h.Handler.(Answer); ok {
+		if !strings.HasSuffix(a.Header().Name, h.Origin) {
+			originated = false
+		}
+	}
+
 	switch h.Qtype {
 	case dns.TypeNS:
-		p.rrType |= rrNs
+		if originated {
+			p.rrType |= rrNs
+		}
 	case dns.TypeSOA:
-		p.rrType |= rrSoa
+		if originated {
+			p.rrType |= rrSoa
+		}
 	case dns.TypeDNAME:
 		p.rrType |= rrDname
 	}
@@ -196,22 +209,19 @@ type value struct {
 }
 
 // previous returns a previous node by canonical order
-func (v value) previous(route string) *node {
-	if v.nearest.name == "" {
-		return nil
-	}
+func (v value) previous() *node {
+	nearestNode := v.nearest.node
+	nearestName := v.nearest.name
+	nomatch := v.node == nil || v.node.name == "*"
 
-	node := v.nearest.node
-	name := v.nearest.name
-
-	if (v.node == nil || v.node.name == "*") && node != nil && name != "" {
-		c := name[0]
+	if nomatch && nearestNode != nil && nearestName != "" {
+		c := nearestName[0]
 		index := -1
 
-		for i := 0; i < len(node.indices); i++ {
-			if node.indices[i] == c {
+		for i := 0; i < len(nearestNode.indices); i++ {
+			if nearestNode.indices[i] == c {
 				index = i
-				if node.wildChild == anonymousWildChild {
+				if nearestNode.wildChild == anonymousWildChild {
 					// 1st child is reserved for '*'
 					index++
 				}
@@ -220,27 +230,57 @@ func (v value) previous(route string) *node {
 		}
 
 		if index != -1 {
-			child := node.children[index]
-			if child.name < name {
+			child := nearestNode.children[index]
+			if !child.isZone() && child.name < nearestName {
 				return child.getMax()
 			}
 		}
+
+		if c == '.' && nearestNode.data != nil {
+			return nearestNode
+		}
+	} else if v.node.isZone() {
+		for i := 0; i < len(v.node.indices); i++ {
+			if v.node.indices[i] != '.' {
+				continue
+			}
+
+			j := i
+			if v.node.wildChild != noWildChild {
+				j++
+			}
+			child := v.node.children[j].getMax()
+			if child.data != nil {
+				return child
+			}
+			break
+		}
+
+		return v.node
+	}
+
+	var zone *node
+	if v.zones != nil {
+		zone = v.zones[len(v.zones)-1].node
 	}
 
 up:
-	if node != nil {
-		var chars [255]uint16
+	if nearestNode != nil && nearestName != "" {
+		c := nearestName[0]
 
-		c := name[0]
-		if node.wildChild == anonymousWildChild && c > '*' {
+		var chars [255]uint16
+		if nearestNode.wildChild == anonymousWildChild && c > '*' {
 			chars['*'] = 1
 		}
 
-		for i := 0; i < len(node.indices); i++ {
-			ch := node.indices[i]
-			if ch < c {
+		dot := -1
+		for i := 0; i < len(nearestNode.indices); i++ {
+			ch := nearestNode.indices[i]
+			if ch == '.' {
+				dot = i
+			} else if ch < c {
 				j := i + 1
-				if node.wildChild == anonymousWildChild {
+				if nearestNode.wildChild != noWildChild {
 					// 1st child is reserved for '*'
 					j++
 				}
@@ -248,35 +288,60 @@ up:
 			}
 		}
 
-		index := -1
+		// first try indices
 		for i := len(chars) - 1; i >= 0; i-- {
 			if j := chars[i]; j > 0 {
-				index = int(j - 1)
-				break
+				child := nearestNode.children[j-1]
+				if child.isZone() {
+					grandchild := child.getMaxChild()
+					if grandchild != nil {
+						return grandchild
+					}
+					if nomatch {
+						return child
+					}
+					continue
+				}
+				return child.getMax()
 			}
 		}
-		if index != -1 {
-			return node.children[index].getMax()
+
+		// then try dot
+		if dot != -1 {
+			if c == '.' && nearestNode.isZone() {
+				return nearestNode
+			}
+
+			if c != '.' && !nearestNode.isZone() {
+				i := dot
+				if nearestNode.wildChild != noWildChild {
+					i++
+				}
+				return nearestNode.children[i].getMax()
+			}
 		}
 
-		for node.data == nil && node.parent != nil {
-			child := node
-			node = node.parent
+		// next try present
+		if nearestNode.data != nil && !nearestNode.isZone() {
+			return nearestNode
+		}
 
-			if child.name != "" {
-				name = child.name
+		// finally go up
+		for nearestNode.parent != nil {
+			if nearestNode.parent == zone {
+				return zone
+			}
+
+			nearestName = nearestNode.name
+			nearestNode = nearestNode.parent
+
+			if nearestName != "" {
 				goto up
 			}
 		}
-
-		if node.data != nil {
-			return node
-		}
-
-		return node.getMax()
 	}
 
-	return nil
+	return v.nearest.node.getMax()
 }
 
 // revertParams reverts params according to indexable domain
@@ -643,6 +708,7 @@ func (n *node) getValue(name string) (v value) {
 		p   Params
 
 		// TODO: Is there an real case that an asterisk across multiple zones?
+
 		// fallback variables are relative to anonymous wildcards.
 		fallback       bool
 		fallbackNode   *node
@@ -870,28 +936,95 @@ walk: // outer loop for walking the tree
 
 // returns the maximum node
 func (n *node) getMax() *node {
-	for n != nil {
-		if len(n.children) == 0 {
-			break
+	if n != nil && len(n.children) > 0 {
+		if len(n.indices) == 0 {
+			child := n.children[0]
+			if child.isZone() {
+				grandchild := child.getMaxChild()
+				if grandchild != nil {
+					return grandchild
+				}
+				return n
+			}
+
+			if v := child.getMax(); v.data != nil {
+				return v
+			}
+			return n
 		}
 
-		if len(n.indices) == 0 {
-			n = n.children[0]
-		} else {
-			i, c := 0, n.indices[0]
-			for j := 1; j < len(n.indices); j++ {
-				if n.indices[j] > c {
-					i, c = j, n.indices[j]
-				}
-			}
+		var chars [255]uint16
+		for i := 0; i < len(n.indices); i++ {
+			j := i + 1
 			if n.wildChild != noWildChild {
-				n = n.children[i+1]
-			} else {
-				n = n.children[i]
+				j++
+			}
+			chars[n.indices[i]] = uint16(j)
+		}
+
+		for i := len(chars) - 1; i >= 0; i-- {
+			if j := chars[i]; j > 0 {
+				child := n.children[j-1]
+				if child.isZone() {
+					grandchild := child.getMaxChild()
+					if grandchild != nil {
+						return grandchild
+					}
+					continue
+				}
+
+				if v := child.getMax(); v.data != nil {
+					return v
+				}
+				return n
 			}
 		}
 	}
+
 	return n
+}
+
+func (n *node) getMaxChild() *node {
+	nop := true
+
+	var chars [255]uint16
+	for i := 0; i < len(n.indices); i++ {
+		if n.indices[i] == '.' {
+			continue
+		}
+
+		nop = false
+		j := i + 1
+		if n.wildChild != noWildChild {
+			j++
+		}
+		chars[n.indices[i]] = uint16(j)
+	}
+
+	if !nop {
+		for i := len(chars) - 1; i >= 0; i-- {
+			if j := chars[i]; j > 0 {
+				child := n.children[j-1]
+				if child.isZone() {
+					grandchild := child.getMaxChild()
+					if grandchild != nil {
+						return grandchild
+					}
+					continue
+				}
+
+				if v := child.getMax(); v.data != nil {
+					return v
+				}
+				return n
+			}
+		}
+	}
+	return nil
+}
+
+func (n *node) isZone() bool {
+	return n != nil && n.data != nil && n.data.rrType&rrZone > 0
 }
 
 // Makes a case-insensitive lookup of the given name and tries to find a handler.

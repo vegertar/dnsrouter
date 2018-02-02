@@ -53,7 +53,7 @@ func (c basicClass) Search(qtype uint16) Handler {
 				return ParamsHandler(h, c.params)
 			}
 		} else {
-			if qtype != dns.TypeRRSIG {
+			if qtype != dns.TypeRRSIG && qtype != dns.TypeNSEC {
 				// DNAME redirection
 				if c.node != nil && c.node.data.rrType&rrDname > 0 && c.cut {
 					h := ParamsHandler(c.handler.Search(dns.TypeDNAME), c.params)
@@ -107,7 +107,17 @@ func (c basicClass) Zone() (Class, bool) {
 	return nil, false
 }
 
-func (c basicClass) NextSecure(_ uint16) Class {
+func (c basicClass) NextSecure(qtype uint16) Class {
+	if qtype == dns.TypeNSEC {
+		node := c.value.previous()
+		if node != nil && node.data != nil {
+			c.handler = node.data.handler
+			c.params = nil
+			c.searchMode = searchAny
+			return c
+		}
+	}
+
 	return nil
 }
 

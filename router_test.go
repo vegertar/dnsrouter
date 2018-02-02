@@ -10,7 +10,6 @@ package dnsrouter
 
 import (
 	"fmt"
-	"math/rand"
 	"reflect"
 	"sort"
 	"strings"
@@ -23,61 +22,6 @@ func BenchmarkIndexable(b *testing.B) {
 	const domain = "alt1.aspmx.l.google.com."
 	for i := 0; i < b.N; i++ {
 		newIndexableName(domain)
-	}
-}
-
-func TestCanonicalOrder(t *testing.T) {
-	input := []string{
-		"example.",
-		"a.example.",
-		"yljkjljk.a.example.",
-		"z.a.example.",
-		"zabc.a.example.",
-		"z.example.",
-		"\001.z.example.",
-		"*.z.example.",
-		"*_.c.b.a.z.example.",
-		"\200.z.example.",
-		":_.z.example.",
-		"a.:_.z.example.",
-		"b.:_.z.example.",
-		"c.b.:_.z.example.",
-		"*_.c.b.:_.z.example.",
-		"*_.z.example.",
-	}
-
-	names := make([]string, 0, len(input))
-	for _, s := range input {
-		names = append(names, newIndexableName(s))
-	}
-	order := make(canonicalOrder, 0, len(names))
-	for _, i := range rand.Perm(len(names)) {
-		order = append(order, names[i])
-	}
-	sort.Sort(order)
-	for i := 0; i < len(order); i++ {
-		for j := i; j < len(order); j++ {
-			if canonicalOrderLess(order[j], order[i]) {
-				t.Errorf("expected %s <= %s, got against", order[i], order[j])
-			}
-		}
-	}
-	if s, found := order.Previous(".example.a"); !found {
-		t.Error(".example.a: should be found, got", s)
-	}
-	if s, found := order.Previous(".example"); !found {
-		t.Error(".example: should be found, got", s)
-	}
-	if s, found := order.Previous(".example.z.a.b.c.d"); found || s != ".example.z.*" {
-		t.Error(".example.z.a.b.c.d: should follow \"*.z.example.\", got", s)
-	}
-
-	revert := make([]string, 0, len(order))
-	for _, s := range order {
-		revert = append(revert, indexable(s))
-	}
-	if !reflect.DeepEqual(input, revert) {
-		t.Error("got wrong order:", revert)
 	}
 }
 
@@ -2906,7 +2850,7 @@ alias.example.org.      IN      TXT     "Wildcard CNAME expansion"
 	router.HandleZone(strings.NewReader(miekZone), "miek.nl.", "stdin")
 	router.HandleZone(strings.NewReader(exampleZone), "example.org.", "stdin")
 
-	printChildren(router.trees[dns.ClassINET], "")
+	//printChildren(router.trees[dns.ClassINET], "")
 
 	for _, tc := range dnsTestCases {
 		resp := new(responseWriter)

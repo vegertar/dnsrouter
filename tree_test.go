@@ -892,7 +892,7 @@ func TestValuePrevious(t *testing.T) {
 
 	for i, route := range routes {
 		v := tree.getValue(route.name)
-		previous := v.previous(route.name)
+		previous := v.previous()
 		if previous != nil && previous.data != nil {
 			previous.data.handler.ServeDNS(nil, nil)
 		}
@@ -921,8 +921,21 @@ func TestZoneValuePrevious(t *testing.T) {
 		qtype    uint16
 		previous string
 	}{
+		{".info", dns.TypeNS, ".info.comg"},
+		{".info.comf", dns.TypeA, ".info"},
+		{".info.comg", dns.TypeA, ".info.comf"},
+
+		{".info.com", dns.TypeNS, ".info.com"},
+
+		{".org.:foo", dns.TypeNS, ".org.:foo"},
+
+		{".org.:foo.:abc", dns.TypeNS, ".org.:foo.:abc.zwe"},
+		{".org.:foo.:abc.xyz", dns.TypeA, ".org.:foo.:abc"},
+		{".org.:foo.:abc.zwe", dns.TypeA, ".org.:foo.:abc.xyz"},
+
 		{".com", dns.TypeNS, ".com"},
-		{".example", dns.TypeNS, ".example.abcd"},
+
+		{".example", dns.TypeNS, ".example.d"},
 		{".example.*", dns.TypeA, ".example"},
 		{".example.a", dns.TypeA, ".example.*"},
 		{".example.a.yljkjljk123", dns.TypeA, ".example.a"},
@@ -931,11 +944,21 @@ func TestZoneValuePrevious(t *testing.T) {
 		{".example.a.zabc", dns.TypeA, ".example.a.z"},
 		{".example.abc", dns.TypeA, ".example.a.zabc"},
 		{".example.abcd", dns.TypeA, ".example.abc"},
-		{".example.c", dns.TypeNS, ".example.c"},
+		{".example.cc", dns.TypeA, ".example.abcd"},
+		{".example.cd", dns.TypeA, ".example.cc"},
+		{".example.d", dns.TypeA, ".example.cd"},
+
+		{".example.c", dns.TypeNS, ".example.c.abcd"},
+		{".example.c.abcd", dns.TypeA, ".example.c"},
+
+		{".example.c.abc", dns.TypeNS, ".example.c.abc.efg"},
+		{".example.c.abc.efg", dns.TypeA, ".example.c.abc"},
+
 		{".example.z", dns.TypeNS, ".example.z.\200"},
 		{".example.z.\001", dns.TypeA, ".example.z"},
 		{".example.z.*", dns.TypeA, ".example.z.\001"},
 		{".example.z.\200", dns.TypeA, ".example.z.*"},
+
 		{".examplef", dns.TypeNS, ".examplef"},
 	}
 
@@ -947,20 +970,48 @@ func TestZoneValuePrevious(t *testing.T) {
 
 	//printChildren(tree, "")
 
-	for i, route := range routes {
+	for _, route := range routes {
 		v := tree.getValue(route.name)
-		previous := v.previous(route.name)
+		previous := v.previous()
 		if previous != nil && previous.data != nil {
 			previous.data.handler.ServeDNS(nil, nil)
 		}
-		expectedRoute := routes[i].previous
+		expectedRoute := route.previous
 		if expectedRoute != fakeHandlerValue {
 			t.Errorf("getting previous of route %s, expected %s, got %s", route.name, expectedRoute, fakeHandlerValue)
 		}
 	}
+
+	tc := [...]struct {
+		name     string
+		previous string
+	}{
+		{".info.cn.hello", ".info"},
+		{".info.com.hello", ".info.com"},
+		{".info.comg.hello", ".info.comg"},
+		{".info.comk", ".info.comg"},
+		{".org.xyz", ".org.:foo"},
+		{".com.xyz.abc", ".com"},
+		{".example.x", ".example.d"},
+		{".example.\001", ".example"},
+		{".example.\100", ".example.*"},
+		{".examplek", ".examplef"},
+	}
+
+	for _, c := range tc {
+		v := tree.getValue(c.name)
+		previous := v.previous()
+		if previous != nil && previous.data != nil {
+			previous.data.handler.ServeDNS(nil, nil)
+		}
+		expectedRoute := c.previous
+		if expectedRoute != fakeHandlerValue {
+			t.Errorf("getting previous of route %s, expected %s, got %s", c.name, expectedRoute, fakeHandlerValue)
+		}
+	}
 }
 
-func BenchmarkValuePrevious(b *testing.B) {
+func BenchmarkValue(b *testing.B) {
 	tree := &node{}
 
 	routes := [...]struct {
@@ -993,8 +1044,17 @@ func BenchmarkValuePrevious(b *testing.B) {
 
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
-		route := routes[i%len(routes)]
-		tree.getValue(route.name).previous(route.name)
-	}
+	b.Run("getValue", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			route := routes[i%len(routes)]
+			tree.getValue(route.name)
+		}
+	})
+
+	b.Run("getValueAndPrevious", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			route := routes[i%len(routes)]
+			tree.getValue(route.name).previous()
+		}
+	})
 }
