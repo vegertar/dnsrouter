@@ -581,7 +581,13 @@ func Classic(ctx context.Context, h Handler) dns.Handler {
 		resp := NewResponseWriter()
 		req := &Request{Msg: r, ctx: ctx}
 		h.ServeDNS(resp, req)
-		if err := w.WriteMsg(resp.Msg().SetReply(r)); err != nil {
+
+		msg := resp.Msg()
+		rcode := msg.Rcode
+		msg = msg.SetReply(r)
+		msg.Rcode = rcode
+
+		if err := w.WriteMsg(msg); err != nil {
 			log.Println("dns.WriteMsg error:", err)
 		}
 	})
@@ -609,7 +615,7 @@ var (
 		BasicHandler,
 	}
 
-	// SimpleScheme consists of essential middlewares without filling out NS and ADDITIONAL sections.
+	// SimpleScheme consists of essential middlewares without filling out AUTHORITY and ADDITIONAL sections.
 	// This scheme is faster (2x bench of DefaultScheme) and suitable for most of ordinary situations.
 	SimpleScheme = []Middleware{
 		PanicHandler,
@@ -651,23 +657,6 @@ func FirstAny(rrSet []dns.RR, t ...uint16) int {
 			if j == rrType {
 				return i
 			}
-		}
-	}
-	return -1
-}
-
-func firstNotAny(rrSet []dns.RR, t ...uint16) int {
-	for i, rr := range rrSet {
-		rrType := rr.Header().Rrtype
-		not := true
-		for _, j := range t {
-			if j == rrType {
-				not = false
-				break
-			}
-		}
-		if not {
-			return i
 		}
 	}
 	return -1
