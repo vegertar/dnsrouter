@@ -29,13 +29,13 @@ func New() *Router {
 	}
 }
 
-// Handle registers a new request handler with the given domain or RR in string.
+// Handle registers a new request handler with a routing pattern, any string that
+// can pass into dns.NewRR is legal to use in here.
 // Only a domain that beginning with a single asterisk (*) is treated as wildcard
 // (https://tools.ietf.org/html/rfc4592), in other cases, wildcard labels or
 // named parameters are treated as same as path components used in httprouter
 // (https://github.com/julienschmidt/httprouter).
-// If s is a literal string which is able to create a dns.RR by dns.NewRR, the
-// handler is optional and defaults to write the resulted record into answer section.
+// If the handler is nil then defaults to write the resulted record into answer section.
 // Please pay attention that Handle won't check if the given string contains an actual
 // record data, e.g. "github.com A" is legal to pass to Handle, so calling
 // Handle("github.com A", nil) causes a strange RR "github.com. 3600 IN A " in ANSWER section.
@@ -65,7 +65,7 @@ func (r *Router) Handle(s string, handler Handler) {
 	})
 }
 
-// HandleFunc registers a new request handler function with the given domain or RR in string.
+// HandleFunc registers a new request handler function with a routing pattern.
 func (r *Router) HandleFunc(s string, handlerFunc HandlerFunc) {
 	r.Handle(s, handlerFunc)
 }
