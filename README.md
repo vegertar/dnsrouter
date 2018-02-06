@@ -20,7 +20,7 @@
 
 DnsRouter is a lightweight high performance DNS request router with chaining middlewares.
 
-Highly inspired by julienschmidt's [HttpRouter](https://github.com/julienschmidt/httprouter) and miekg's [CoreDNS](https://github.com/coredns/coredns), actually, this router is developed upon HttpRouter's extreamely fast radix tree, and passed all test cases of [file](https://github.com/coredns/coredns/blob/master/plugin/file) plugin from CoreDNS.
+Highly inspired by julienschmidt's [HttpRouter](https://github.com/julienschmidt/httprouter) and miekg's [CoreDNS](https://github.com/coredns/coredns), actually, this router is developed upon HttpRouter's extremely fast radix tree, and passed all test cases of [file](https://github.com/coredns/coredns/blob/master/plugin/file) plugin from CoreDNS.
 
 In contrast to CoreDNS which is a complete DNS server, DnsRouter is targeting a library of a tree of stub name servers, all other resolving functions like filling out `ANSWER`, `AUTHORITY`, `ADDITIONAL` sections are designed as middlewares, which makes name server efficient and flexible.
 
@@ -34,9 +34,9 @@ In contrast to CoreDNS which is a complete DNS server, DnsRouter is targeting a 
 
 **Nearly Zero Garbage**: As [HttpRouter](https://github.com/julienschmidt/httprouter), the tree related processes generate zero bytes of garbage, the actual up to 4 more heap allocations that are made, is from zone slice (1 alloc), domain name reversing (2 allocs), and a returning of an interface (1 alloc).
 
-**Out-of-box stub name server**: The builtin middlewares are organzied into two schemes, `DefaultScheme` and `SimpleScheme`. Use these schemes make DnsRouter working as an out-of-box stub name server, i.e. looking up name records, following CNAME redirections, expanding wildcards, supplying DNSSEC RRset and recovering panic, etc. What the different of `DefaultScheme` and `SimpleScheme` is that the later doesn't filling out `AUTHORITY` and `ADDITIONAL` sections.
+**Out-of-box stub name server**: The builtin middlewares are organized into two schemes, `DefaultScheme` and `SimpleScheme`. Use these schemes make DnsRouter working as an out-of-box stub name server, i.e. looking up name records, following CNAME redirection, expanding wildcards, supplying DNSSEC RRset and recovering panic, etc. What the different of `DefaultScheme` and `SimpleScheme` is that the later doesn't filling out `AUTHORITY` and `ADDITIONAL` sections.
 
-**Chaining middlewares**: DnsRoute scales well by chaining middlewares, enjoyly choose what you need from builtin middlewares or implement your owns to extend stub name server, e.g. a recursive resolver or cache.
+**Chaining middlewares**: DnsRoute scales well by chaining middlewares, enjoyably choose what you need from builtin middlewares or implement your owns to extend stub name server, e.g. a recursive resolver or cache.
 
 **Fast**: [Benchmarks](#benchmarks) show DnsRouter is **2x to 4x** faster than [file](https://github.com/coredns/coredns/blob/master/plugin/file) plugin of CoreDNS.
 
@@ -132,7 +132,7 @@ local.                  3600    IN      A       127.0.0.1
 _dns._udp.              0       IN      SRV     0 0 10053 local.
 ```
 
-Wants to known what happends when raises an exception? Adds some lines like below.
+Wants to known what happens when raises an exception? Adds some lines like below.
 
 ```go
 	router.HandleFunc("local. SRV", func(w dnsrouter.ResponseWriter, req *dnsrouter.Request) {
@@ -285,4 +285,4 @@ There are some works in planed:
 - 100% code coverage
 - Better examples and docs.
 
-Any contributions are wellcome.
+Any contributions are welcome.
